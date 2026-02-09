@@ -256,6 +256,61 @@ class SpectralDecomposer(nn.Module):
 
         return peaks, freq_refined, dlnf_refined, topk_vals
 
+    def peak_phases(self, X: torch.Tensor, peaks: torch.Tensor,
+                    freq_refined: torch.Tensor, dlnf_refined: torch.Tensor,
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Estimate phase at hop boundaries for each detected peak.
+
+        Uses the complex STFT value at the integer peak bin, corrects for
+        the fractional-bin offset (Hann-window phase centre), then
+        propagates the phase forward by one hop accounting for the chirp.
+
+        Parameters
+        ----------
+        X : complex Tensor, shape (D, N_WINDOWS, k)
+        peaks : LongTensor, shape (N_WINDOWS, K, 2)
+            Integer (dlnf_idx, freq_idx) from find_peaks.
+        freq_refined : Tensor, shape (N_WINDOWS, K)
+            Fractional frequency bin index.
+        dlnf_refined : Tensor, shape (N_WINDOWS, K)
+            Interpolated dlnf value.
+
+        Returns
+        -------
+        phi_0 : Tensor, shape (N_WINDOWS, K)
+            Phase at the start of each window.
+        phi_1 : Tensor, shape (N_WINDOWS, K)
+            Phase propagated forward by one hop (= start of next window).
+        """
+        dlnf_idx = peaks[:, :, 0]
+        freq_idx = peaks[:, :, 1]
+
+        # Gather complex STFT at integer peak bins
+        Xp = X.permute(1, 0, 2).reshape(X.shape[1], -1)   # (W, D*k)
+        flat_idx = dlnf_idx * X.shape[2] + freq_idx        # (W, K)
+        X_peak = Xp.gather(1, flat_idx)                     # (W, K) complex
+
+        # Phase at window start, corrected for fractional bin offset.
+        # For Hann window with centre at sample (k-1)/2, a fractional
+        # offset delta introduces phase pi * delta * (k-1) / k.
+        f_delta = freq_refined - freq_idx.float()
+        phi_start = X_peak.angle() - torch.pi * f_delta * (self.k - 1) / self.k
+
+        # Phase increment over one hop:
+        # integral_0^{T_hop} 2*pi*f(t) dt  where f(t) = f0*exp(dlnf*t/T_hop)
+        # = pi * f_bin * (exp(dlnf) - 1) / dlnf
+        # (using f_hz * T_hop = f_bin * hop/k = f_bin / 2)
+        dl = dlnf_refined
+        safe_dl = torch.where(dl.abs() < 1e-10,
+                               torch.ones_like(dl) * 1e-10, dl)
+        chirp_factor = (torch.exp(dl) - 1.0) / safe_dl
+        chirp_factor = torch.where(dl.abs() < 1e-10,
+                                    torch.ones_like(chirp_factor), chirp_factor)
+
+        phase_inc = torch.pi * freq_refined * chirp_factor
+
+        return phi_start, phi_start + phase_inc
+
 
 if __name__ == "__main__":
     import numpy as np
@@ -277,12 +332,7 @@ if __name__ == "__main__":
         h += A_t * np.exp(-1.5 * (k_harm - 1)) * np.cos(k_harm * phase)
     fs = N / T_obs
 
-    # Add unit-variance white noise
-    noise = np.random.default_rng(42).standard_normal(N)
-    x_noisy = h + noise
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    x = torch.from_numpy(x_noisy).float().to(device)
 
     k = 4096
     decomposer = SpectralDecomposer(k=k).to(device)
@@ -292,66 +342,133 @@ if __name__ == "__main__":
     dlnf_min, dlnf_max, n_dlnf = 0.0, 0.05, 21
     dlnf_grid = torch.linspace(dlnf_min, dlnf_max, n_dlnf, device=device)
 
-    # Batched STFT over the full dlnf grid (includes dlnf=0)
-    X_grid = decomposer(x, dlnf=dlnf_grid)  # (D, N_WINDOWS, k)
+    # --- Noise sweep (spectral_demo.png) ---
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import Normalize
 
-    # --- Spectrogram at dlnf=0 for reference ---
-    X_zero = X_grid[0]  # dlnf_grid[0] == 0
-    amplitude = X_zero.abs().cpu().numpy()[:, :k // 2 + 1]
-    snr = amplitude / noise_rms
-    n_windows = snr.shape[0]
-    t_centers = (np.arange(n_windows) * decomposer.hop + k / 2) / fs
-    f_bins = np.arange(k // 2 + 1) * fs / k
+    noise_sigmas = [1.0, 5.0, 15.0, 40.0]
+    rng = np.random.default_rng(42)
 
-    fig, ax = plt.subplots(figsize=(12, 3))
-    im = ax.pcolormesh(t_centers, f_bins, snr.T, shading="nearest",
-                        cmap="inferno", vmin=0)
-    ax.set_yscale("log")
-    ax.set_ylim(params["f0"] * 0.5,
-                 params["f0"] * (params["n_harmonics"] + 1) * 5)
-    ax.set_ylabel("f (Hz)")
-    ax.set_xlabel("t (s)")
-    ax.set_title("dlnf = 0")
-    fig.colorbar(im, ax=ax, label="SNR")
+    fig, axes = plt.subplots(len(noise_sigmas), 1,
+                              figsize=(12, 3.5 * len(noise_sigmas)),
+                              sharex=True, sharey=True)
+
+    for ax, sigma in zip(axes, noise_sigmas):
+        noise = rng.standard_normal(N) * sigma
+        x_noisy = h + noise
+        x = torch.from_numpy(x_noisy).float().to(device)
+
+        X_grid = decomposer(x, dlnf=dlnf_grid)
+        amp_zero = X_grid[0].abs().cpu().numpy()[:, :k // 2 + 1]
+        snr = amp_zero / (noise_rms * sigma)
+        n_windows = snr.shape[0]
+        t_centers = (np.arange(n_windows) * decomposer.hop + k / 2) / fs
+        f_bins = np.arange(k // 2 + 1) * fs / k
+
+        im = ax.pcolormesh(t_centers, f_bins, snr.T, shading="nearest",
+                            cmap="inferno", vmin=0, vmax=30)
+        ax.set_yscale("log")
+        ax.set_ylim(params["f0"] * 0.5,
+                     params["f0"] * (params["n_harmonics"] + 1) * 5)
+
+        peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
+            X_grid, K=3, dlnf_grid=dlnf_grid)
+        f_peak = freq_refined.cpu().numpy() * fs / k
+        dlnf_peak = dlnf_refined.cpu().numpy()
+        dt_half = decomposer.hop / fs / 2
+
+        for wi in range(n_windows):
+            for ki in range(3):
+                fc, dl, tc = f_peak[wi, ki], dlnf_peak[wi, ki], t_centers[wi]
+                ax.plot([tc - dt_half, tc + dt_half],
+                        [fc * np.exp(-dl / 2), fc * np.exp(dl / 2)],
+                        color="cyan", lw=0.8, solid_capstyle="round")
+
+        ax.set_ylabel("f (Hz)")
+        ax.set_title(f"noise σ = {sigma}")
+        fig.colorbar(im, ax=ax, label="SNR")
+
+    axes[-1].set_xlabel("t (s)")
     plt.tight_layout()
     plt.savefig("spectral_demo.png", dpi=150)
     print("Saved spectral_demo.png")
 
-    # --- Peak finder with slope lines ---
+    # --- Phase continuity demo (peaks_demo.png) ---
+    # Use sigma=5: 3rd harmonic is borderline, good for showing phase breakdown.
+    sigma = 5.0
+    noise = np.random.default_rng(42).standard_normal(N) * sigma
+    x = torch.from_numpy((h + noise)).float().to(device)
+    X_grid = decomposer(x, dlnf=dlnf_grid)
+
+    n_windows = (N - k) // (k // 2) + 1
+    t_centers = (np.arange(n_windows) * decomposer.hop + k / 2) / fs
+    f_bins = np.arange(k // 2 + 1) * fs / k
+    amp_zero = X_grid[0].abs().cpu().numpy()[:, :k // 2 + 1]
+    snr = amp_zero / (noise_rms * sigma)
+
     peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
-        X_grid, K=3, dlnf_grid=dlnf_grid,
-    )
+        X_grid, K=3, dlnf_grid=dlnf_grid)
+    phi_0, phi_1 = decomposer.peak_phases(
+        X_grid, peaks, freq_refined, dlnf_refined)
 
-    fig2, ax2 = plt.subplots(figsize=(12, 4))
-    im = ax2.pcolormesh(t_centers, f_bins, snr.T, shading="nearest",
-                         cmap="inferno", vmin=0)
-    ax2.set_yscale("log")
-    ax2.set_ylim(params["f0"] * 0.5,
-                  params["f0"] * (params["n_harmonics"] + 1) * 5)
+    # Phase residual: wrap(phi_0[w+1] - phi_1[w]) for consecutive windows
+    residual = phi_0[1:] - phi_1[:-1]                 # (W-1, K)
+    residual = ((residual + torch.pi) % (2 * torch.pi)) - torch.pi  # wrap to [-pi, pi]
+    residual_np = residual.cpu().numpy()               # (W-1, K)
+    t_res = 0.5 * (t_centers[:-1] + t_centers[1:])    # midpoints
 
-    # Draw slope lines: each spans one hop centred on the window
-    f_peak = freq_refined.cpu().numpy() * fs / k    # (N_WINDOWS, 3) Hz
-    dlnf_peak = dlnf_refined.cpu().numpy()           # (N_WINDOWS, 3)
-    dt_half = decomposer.hop / fs / 2                # half a hop in seconds
+    f_peak = freq_refined.cpu().numpy() * fs / k
+    dlnf_peak = dlnf_refined.cpu().numpy()
+    dt_half = decomposer.hop / fs / 2
 
-    for wi in range(n_windows):
-        for ki in range(3):
-            fc = f_peak[wi, ki]
-            dl = dlnf_peak[wi, ki]
-            tc = t_centers[wi]
-            t_seg = [tc - dt_half, tc + dt_half]
-            f_seg = [fc * np.exp(-dl / 2), fc * np.exp(dl / 2)]
-            ax2.plot(t_seg, f_seg, color="cyan", lw=1.0, solid_capstyle="round")
+    # Per-segment phase residual magnitude for coloring (W-1 values; pad last)
+    res_abs = np.abs(residual_np)                       # (W-1, K)
+    res_pad = np.concatenate([res_abs, res_abs[-1:]], axis=0)  # (W, K)
+    norm = Normalize(vmin=0, vmax=np.pi)
 
-    # Dummy line for legend
-    ax2.plot([], [], color="cyan", lw=1.0, label="top-3 peaks")
+    fig2, (ax_spec, ax_res) = plt.subplots(
+        2, 1, figsize=(12, 6), height_ratios=[2, 1], sharex=True)
 
-    ax2.set_xlabel("t (s)")
-    ax2.set_ylabel("f (Hz)")
-    ax2.set_title(f"Detected peaks with chirp slopes "
-                  f"(dlnf grid: [{dlnf_min}, {dlnf_max}], n={n_dlnf})")
-    ax2.legend(loc="lower right")
-    fig2.colorbar(im, ax=ax2, label="SNR")
+    # -- Top: spectrogram with slope lines coloured by phase residual --
+    im = ax_spec.pcolormesh(t_centers, f_bins, snr.T, shading="nearest",
+                             cmap="inferno", vmin=0, vmax=30)
+    ax_spec.set_yscale("log")
+    ax_spec.set_ylim(params["f0"] * 0.5,
+                      params["f0"] * (params["n_harmonics"] + 1) * 5)
+
+    cmap_phase = plt.cm.RdYlGn_r   # green = 0, red = pi
+    for ki in range(3):
+        segments = []
+        colors = []
+        for wi in range(n_windows):
+            fc, dl, tc = f_peak[wi, ki], dlnf_peak[wi, ki], t_centers[wi]
+            segments.append([(tc - dt_half, fc * np.exp(-dl / 2)),
+                             (tc + dt_half, fc * np.exp(dl / 2))])
+            colors.append(cmap_phase(norm(res_pad[wi, ki])))
+        lc = LineCollection(segments, colors=colors, linewidths=1.0,
+                            capstyle="round")
+        ax_spec.add_collection(lc)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap_phase, norm=norm)
+    fig2.colorbar(sm, ax=ax_spec, label="|Δφ| (rad)")
+    fig2.colorbar(im, ax=ax_spec, label="SNR", location="left")
+    ax_spec.set_ylabel("f (Hz)")
+    ax_spec.set_title(f"Phase continuity (σ = {sigma}): "
+                       "green = coherent, red = lost")
+
+    # -- Bottom: wrapped phase residual vs time --
+    labels = ["fundamental", "2nd harmonic", "3rd harmonic"]
+    colors_line = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+    for ki in range(3):
+        ax_res.scatter(t_res, residual_np[:, ki], s=3, alpha=0.6,
+                        color=colors_line[ki], label=labels[ki])
+    ax_res.axhline(0, color="gray", lw=0.5, ls="--")
+    ax_res.set_ylim(-np.pi * 1.1, np.pi * 1.1)
+    ax_res.set_ylabel("Δφ (rad)")
+    ax_res.set_xlabel("t (s)")
+    ax_res.legend(loc="upper left", fontsize=8, ncol=3)
+    ax_res.set_title("Phase residual:  φ₀(w+1) − φ₁(w)")
+
     plt.tight_layout()
     plt.savefig("peaks_demo.png", dpi=150)
     print("Saved peaks_demo.png")
