@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Gravitational wave signal analysis toolkit, installable as the `spectral_tokens` Python package.
+Gravitational wave signal analysis toolkit, installable as the `fuge` Python package.
 
-- **`src/spectral_tokens/spectral.py`** — PyTorch-based Short-Time Fourier Transform (STFT) with de-chirping for time-frequency analysis
-- **`src/spectral_tokens/emri.py`** — JAX-based synthetic EMRI (Extreme Mass Ratio Inspiral) waveform generator with autodiff support
+- **`src/fuge/spectral.py`** — PyTorch-based Short-Time Fourier Transform (STFT) with de-chirping for time-frequency analysis
+- **`src/fuge/emri.py`** — JAX-based synthetic EMRI (Extreme Mass Ratio Inspiral) waveform generator with autodiff support
 
 ## Installation
 
@@ -31,7 +31,7 @@ There is no formal test suite. Demo scripts live in `examples/`. No build system
 
 **Dual-framework design:** PyTorch for signal analysis, JAX for signal synthesis. This split is intentional — PyTorch handles efficient GPU tensor operations for STFT windowing, while JAX provides automatic differentiation through the waveform model for parameter optimization.
 
-### `src/spectral_tokens/spectral.py` — `SpectralDecomposer(nn.Module)`
+### `src/fuge/spectral.py` — `SpectralDecomposer(nn.Module)`
 
 STFT with half-overlapping Hann windows (hop = k/2). Two de-chirp modes that can be combined:
 
@@ -42,7 +42,7 @@ Input: `(N,)` or `(B, N)` tensor. Output: complex `(N_WINDOWS, k)` tensor.
 
 The `dlnf` parameter is per-hop and internally scaled by 2 for the full window. Resampling uses linear interpolation on an exponentially warped time grid: `τ(t) = (exp(βt) - 1) / (exp(β) - 1)`.
 
-### `src/spectral_tokens/emri.py` — `emri_signal()` / `_emri_impl()`
+### `src/fuge/emri.py` — `emri_signal()` / `_emri_impl()`
 
 Post-Newtonian inspired waveform: `f(t) = f₀(1 - t/t_c)^(-3/8 · chirp_mass)`, amplitude `A(t) = A₀(1 - t/t_c)^(-1/4)`, with harmonic sum `h(t) = Σ A_k(t) cos(k φ(t))`.
 
@@ -51,13 +51,13 @@ Phase accumulated via trapezoidal integration (O(dt²)). Harmonics summed with `
 ## Package structure
 
 ```
-spectral-tokens/
+fuge/
 ├── pyproject.toml
 ├── CLAUDE.md
 ├── LICENSE
 ├── .gitignore
 ├── src/
-│   └── spectral_tokens/
+│   └── fuge/
 │       ├── __init__.py         # exports SpectralDecomposer, emri_signal
 │       ├── spectral.py
 │       └── emri.py

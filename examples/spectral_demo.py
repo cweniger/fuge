@@ -6,7 +6,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 import torch
 
-from spectral_tokens import SpectralDecomposer
+from fuge import SpectralDecomposer
 
 if __name__ == "__main__":
     # Inline test signal (PN-inspired chirp, no JAX dependency)

@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
 
-from spectral_tokens.emri import _emri_impl
+from fuge.emri import _emri_impl
 
 # ── Signal parameters (matching transformer_demo.py) ────────────────
 T_C = 1e6

@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-from spectral_tokens import SpectralDecomposer, emri_signal
+from fuge import SpectralDecomposer, emri_signal
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000
