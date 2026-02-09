@@ -7,6 +7,7 @@ and compares with the transformer's empirical performance.
 import time
 
 import jax
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
@@ -23,7 +24,9 @@ N = 100_000
 T_OBS = 0.9 * T_C
 SIGMA = 1.0
 
-F0_MIN, F0_MAX = 2.7425e-3, 2.7575e-3
+F0_CENTER = 2.75e-3
+F0_HALF = 1.5e-8  # 30 nHz half-width (matching transformer_demo.py)
+F0_MIN, F0_MAX = F0_CENTER - F0_HALF, F0_CENTER + F0_HALF
 
 
 # =====================================================================
@@ -91,11 +94,13 @@ if __name__ == "__main__":
     print(f"  CRB relative error:    {np.median(crb_rel):.6%}")
 
     # --- Compare with transformer ---
-    # From latest transformer_demo.py run
-    transformer_median_rel = 0.0013 / 100  # 0.0013%
+    # From latest transformer_demo.py run (30 nHz prior, k=1024, float64)
+    transformer_median_abs = 2.58e-10  # Hz
+    transformer_eff_sigma = transformer_median_abs / 0.6745  # Gaussian median|err| = 0.6745*σ
 
-    print(f"\n  Transformer rel error: {transformer_median_rel:.6%}")
-    print(f"  Ratio (transformer / CRB): {transformer_median_rel / np.median(crb_rel):.1f}x")
+    print(f"\n  Transformer median |err|: {transformer_median_abs:.2e} Hz")
+    print(f"  Transformer eff. σ:       {transformer_eff_sigma:.2e} Hz")
+    print(f"  Ratio (transformer σ / CRB σ): {transformer_eff_sigma / np.median(crb_sigma):.1f}x")
 
     # --- Plot ---
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
@@ -116,8 +121,9 @@ if __name__ == "__main__":
     crb_med = np.median(crb_rel) * 100
     ax.axvline(crb_med, color="steelblue", ls="--", lw=2,
                label=f"CRB median: {crb_med:.2e}%")
+    transformer_median_rel = transformer_eff_sigma / np.median(val_f0)
     ax.axvline(transformer_median_rel * 100, color="orangered", ls="-", lw=2,
-               label=f"Transformer: {transformer_median_rel * 100:.4f}%")
+               label=f"Transformer: {transformer_median_rel * 100:.6f}%")
     ax.set_xlabel("Relative error (%)")
     ax.set_ylabel("Count")
     ax.set_title("CRB vs Transformer")
