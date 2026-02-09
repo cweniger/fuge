@@ -133,11 +133,19 @@ class SpectralDecomposer(nn.Module):
         D = betas.shape[0]
         tau_uniform = torch.linspace(0.0, 1.0, self.k, device=windowed.device)  # (k,)
 
-        eb = torch.exp(betas)  # (D,)
+        # Replace near-zero betas to avoid division by zero;
+        # for |beta| < eps the warped grid is effectively identity.
+        safe = betas.abs() < 1e-8
+        betas_safe = torch.where(safe, torch.ones_like(betas) * 1e-8, betas)
+
+        eb = torch.exp(betas_safe)  # (D,)
         # Source positions: (D, k)
-        t_source = (2.0 / betas.unsqueeze(1)) * torch.log(
+        t_source = (2.0 / betas_safe.unsqueeze(1)) * torch.log(
             1.0 + tau_uniform.unsqueeze(0) * (eb.unsqueeze(1) - 1.0)
         ) - 1.0
+        # For near-zero betas, use identity grid
+        identity = torch.linspace(-1.0, 1.0, self.k, device=windowed.device)
+        t_source = torch.where(safe.unsqueeze(1), identity.unsqueeze(0), t_source)
 
         # Map to index space [0, k-1]
         idx = (t_source + 1.0) * 0.5 * (self.k - 1)  # (D, k)
@@ -157,14 +165,15 @@ class SpectralDecomposer(nn.Module):
 
         return resampled
 
-    def find_peaks(self, X: torch.Tensor, K: int, radius: int = 2
-                   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def find_peaks(self, X: torch.Tensor, K: int, dlnf_grid: torch.Tensor,
+                   radius: int = 2,
+                   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Find top K peaks in the (dlnf, freq) plane per time window.
 
         A pixel is a peak iff it equals the max in its (2r+1)x(2r+1)
         neighborhood (via max-pool), then the K strongest peaks are returned.
-        Frequency positions are refined via parabolic interpolation on the
-        amplitude of the peak bin and its two frequency neighbours.
+        Both frequency and dlnf positions are refined via parabolic
+        interpolation on the amplitude and its immediate neighbours.
 
         Parameters
         ----------
@@ -172,6 +181,8 @@ class SpectralDecomposer(nn.Module):
             Batched STFT output from forward() with a 1-D dlnf tensor.
         K : int
             Number of peaks to return per time window.
+        dlnf_grid : Tensor, shape (D,)
+            The dlnf values used to produce X (assumed linearly spaced).
         radius : int
             Suppression radius (default 2): peak must be the maximum in
             a (2*radius+1) x (2*radius+1) window in the (dlnf, freq) plane.
@@ -182,8 +193,10 @@ class SpectralDecomposer(nn.Module):
             Integer (dlnf_idx, freq_idx) of each peak.
         freq_refined : Tensor, shape (N_WINDOWS, K)
             Parabolic-interpolated fractional frequency bin index.
+        dlnf_refined : Tensor, shape (N_WINDOWS, K)
+            Parabolic-interpolated dlnf value.
         values : Tensor, shape (N_WINDOWS, K)
-            Parabolic-interpolated amplitude at each peak.
+            Amplitude at integer peak location.
         """
         # Positive frequencies only
         amp = X[:, :, :self.k // 2 + 1].abs()  # (D, N_WINDOWS, F)
@@ -207,25 +220,41 @@ class SpectralDecomposer(nn.Module):
         freq_idx = topk_idx % Fk
         peaks = torch.stack([dlnf_idx, freq_idx], dim=-1)  # (W, K, 2)
 
+        amp_2d = amp.reshape(W, -1)  # (W, D*Fk)
+
         # --- Parabolic interpolation along frequency axis ---
-        fi = freq_idx.clamp(1, Fk - 2)  # ensure neighbours exist
-        amp_2d = amp.reshape(W, -1)      # (W, D*Fk)
-        flat_m = dlnf_idx * Fk + (fi - 1)
-        flat_0 = dlnf_idx * Fk + fi
-        flat_p = dlnf_idx * Fk + (fi + 1)
-        y_m = amp_2d.gather(1, flat_m)   # (W, K)
-        y_0 = amp_2d.gather(1, flat_0)
-        y_p = amp_2d.gather(1, flat_p)
+        fi = freq_idx.clamp(1, Fk - 2)
+        f_flat_m = dlnf_idx * Fk + (fi - 1)
+        f_flat_0 = dlnf_idx * Fk + fi
+        f_flat_p = dlnf_idx * Fk + (fi + 1)
+        yf_m = amp_2d.gather(1, f_flat_m)
+        yf_0 = amp_2d.gather(1, f_flat_0)
+        yf_p = amp_2d.gather(1, f_flat_p)
 
-        denom = y_m - 2.0 * y_0 + y_p
-        delta = 0.5 * (y_m - y_p) / denom
-        delta = torch.where(denom.abs() < 1e-12, torch.zeros_like(delta), delta)
-        delta = delta.clamp(-0.5, 0.5)
+        f_denom = yf_m - 2.0 * yf_0 + yf_p
+        f_delta = 0.5 * (yf_m - yf_p) / f_denom
+        f_delta = torch.where(f_denom.abs() < 1e-12, torch.zeros_like(f_delta), f_delta)
+        f_delta = f_delta.clamp(-0.5, 0.5)
+        freq_refined = fi.float() + f_delta
 
-        freq_refined = fi.float() + delta               # fractional bin index
-        values_refined = y_0 - 0.25 * (y_m - y_p) * delta  # interpolated amplitude
+        # --- Parabolic interpolation along dlnf axis ---
+        di = dlnf_idx.clamp(1, D - 2)
+        d_flat_m = (di - 1) * Fk + freq_idx
+        d_flat_0 = di * Fk + freq_idx
+        d_flat_p = (di + 1) * Fk + freq_idx
+        yd_m = amp_2d.gather(1, d_flat_m)
+        yd_0 = amp_2d.gather(1, d_flat_0)
+        yd_p = amp_2d.gather(1, d_flat_p)
 
-        return peaks, freq_refined, values_refined
+        d_denom = yd_m - 2.0 * yd_0 + yd_p
+        d_delta = 0.5 * (yd_m - yd_p) / d_denom
+        d_delta = torch.where(d_denom.abs() < 1e-12, torch.zeros_like(d_delta), d_delta)
+        d_delta = d_delta.clamp(-0.5, 0.5)
+
+        dlnf_step = dlnf_grid[1] - dlnf_grid[0] if D > 1 else torch.ones(1, device=X.device)
+        dlnf_refined = dlnf_grid[di] + d_delta * dlnf_step
+
+        return peaks, freq_refined, dlnf_refined, topk_vals
 
 
 if __name__ == "__main__":
@@ -259,68 +288,39 @@ if __name__ == "__main__":
     decomposer = SpectralDecomposer(k=k).to(device)
     noise_rms = np.sqrt(k * 3.0 / 8.0)
 
-    dlnf_values = [-0.1, -0.05, 0.0, 0.05, 0.1]
+    # --- dlnf grid hyperparameters ---
+    dlnf_min, dlnf_max, n_dlnf = 0.0, 0.05, 21
+    dlnf_grid = torch.linspace(dlnf_min, dlnf_max, n_dlnf, device=device)
 
-    # Batched call: all non-zero dlnf values in one forward pass
-    dlnf_nonzero = [v for v in dlnf_values if v != 0.0]
-    dlnf_tensor = torch.tensor(dlnf_nonzero, device=device)
-    X_batched = decomposer(x, dlnf=dlnf_tensor)  # (D, N_WINDOWS, k)
-    X_zero = decomposer(x, dlnf=0.0)              # (N_WINDOWS, k)
+    # Batched STFT over the full dlnf grid (includes dlnf=0)
+    X_grid = decomposer(x, dlnf=dlnf_grid)  # (D, N_WINDOWS, k)
 
-    # Reassemble in original order
-    results = {}
-    j = 0
-    for v in dlnf_values:
-        if v == 0.0:
-            results[v] = X_zero
-        else:
-            results[v] = X_batched[j]
-            j += 1
-
-    fig, axes = plt.subplots(len(dlnf_values), 1, figsize=(12, 3 * len(dlnf_values)),
-                              sharex=True, sharey=True)
-
-    for ax, dlnf_val in zip(axes, dlnf_values):
-        X = results[dlnf_val]
-        amplitude = X.abs().cpu().numpy()[:, :k // 2 + 1]
-        snr = amplitude / noise_rms
-
-        n_windows = snr.shape[0]
-        t_centers = (np.arange(n_windows) * decomposer.hop + k / 2) / fs
-        f_bins = np.arange(k // 2 + 1) * fs / k
-
-        im = ax.pcolormesh(t_centers, f_bins, snr.T, shading="nearest",
-                            cmap="inferno", vmin=0)
-        ax.set_yscale("log")
-        ax.set_ylim(params["f0"] * 0.5,
-                     params["f0"] * (params["n_harmonics"] + 1) * 5)
-        ax.set_ylabel("f (Hz)")
-        ax.set_title(f"dlnf = {dlnf_val}")
-        fig.colorbar(im, ax=ax, label="SNR")
-
-        # Overlay expected track: ln(f) increases by dlnf per window step
-        if dlnf_val != 0.0:
-            f_start = params["f0"] * 1.05
-            win_idx = np.arange(n_windows)
-            f_track = f_start * np.exp(dlnf_val * win_idx)
-            ax.plot(t_centers, f_track, '--', color='cyan', lw=1, alpha=0.7,
-                    label=f'slope = dlnf')
-            ax.legend(loc='lower right', fontsize=8)
-
-    axes[-1].set_xlabel("t (s)")
-    plt.tight_layout()
-    plt.savefig("spectral_demo.png", dpi=150)
-    print("Saved spectral_demo.png")
-
-    # --- Peak finder plot: spectrogram (dlnf=0) with top-3 peaks overlaid ---
-    X_dlnf0 = X_zero.unsqueeze(0)  # (1, N_WINDOWS, k)
-    peaks, freq_refined, peak_vals = decomposer.find_peaks(X_dlnf0, K=3)
-
+    # --- Spectrogram at dlnf=0 for reference ---
+    X_zero = X_grid[0]  # dlnf_grid[0] == 0
     amplitude = X_zero.abs().cpu().numpy()[:, :k // 2 + 1]
     snr = amplitude / noise_rms
     n_windows = snr.shape[0]
     t_centers = (np.arange(n_windows) * decomposer.hop + k / 2) / fs
     f_bins = np.arange(k // 2 + 1) * fs / k
+
+    fig, ax = plt.subplots(figsize=(12, 3))
+    im = ax.pcolormesh(t_centers, f_bins, snr.T, shading="nearest",
+                        cmap="inferno", vmin=0)
+    ax.set_yscale("log")
+    ax.set_ylim(params["f0"] * 0.5,
+                 params["f0"] * (params["n_harmonics"] + 1) * 5)
+    ax.set_ylabel("f (Hz)")
+    ax.set_xlabel("t (s)")
+    ax.set_title("dlnf = 0")
+    fig.colorbar(im, ax=ax, label="SNR")
+    plt.tight_layout()
+    plt.savefig("spectral_demo.png", dpi=150)
+    print("Saved spectral_demo.png")
+
+    # --- Peak finder with slope lines ---
+    peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
+        X_grid, K=3, dlnf_grid=dlnf_grid,
+    )
 
     fig2, ax2 = plt.subplots(figsize=(12, 4))
     im = ax2.pcolormesh(t_centers, f_bins, snr.T, shading="nearest",
@@ -329,15 +329,27 @@ if __name__ == "__main__":
     ax2.set_ylim(params["f0"] * 0.5,
                   params["f0"] * (params["n_harmonics"] + 1) * 5)
 
-    # Scatter top-3 peaks (parabolic-interpolated) for every time window
-    f_peak = freq_refined.cpu().numpy() * fs / k         # (N_WINDOWS, 3) in Hz
-    t_peak = np.repeat(t_centers[:, None], 3, axis=1)    # (N_WINDOWS, 3)
-    ax2.scatter(t_peak.ravel(), f_peak.ravel(), color="cyan", s=8,
-                edgecolors="white", linewidths=0.3, zorder=5, label="top-3 peaks")
+    # Draw slope lines: each spans one hop centred on the window
+    f_peak = freq_refined.cpu().numpy() * fs / k    # (N_WINDOWS, 3) Hz
+    dlnf_peak = dlnf_refined.cpu().numpy()           # (N_WINDOWS, 3)
+    dt_half = decomposer.hop / fs / 2                # half a hop in seconds
+
+    for wi in range(n_windows):
+        for ki in range(3):
+            fc = f_peak[wi, ki]
+            dl = dlnf_peak[wi, ki]
+            tc = t_centers[wi]
+            t_seg = [tc - dt_half, tc + dt_half]
+            f_seg = [fc * np.exp(-dl / 2), fc * np.exp(dl / 2)]
+            ax2.plot(t_seg, f_seg, color="cyan", lw=1.0, solid_capstyle="round")
+
+    # Dummy line for legend
+    ax2.plot([], [], color="cyan", lw=1.0, label="top-3 peaks")
 
     ax2.set_xlabel("t (s)")
     ax2.set_ylabel("f (Hz)")
-    ax2.set_title("dlnf = 0, with detected peaks (parabolic interpolation)")
+    ax2.set_title(f"Detected peaks with chirp slopes "
+                  f"(dlnf grid: [{dlnf_min}, {dlnf_max}], n={n_dlnf})")
     ax2.legend(loc="lower right")
     fig2.colorbar(im, ax=ax2, label="SNR")
     plt.tight_layout()
