@@ -1,4 +1,4 @@
-"""Transformer demo: predict EMRI parameters from spectral tokens."""
+"""Transformer demo: predict EMRI f0 from spectral tokens."""
 
 import time
 
@@ -13,7 +13,7 @@ from spectral_tokens import SpectralDecomposer, emri_signal
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000
-N_TRAIN = 2000
+N_TRAIN = 5000
 N_VAL = 500
 NOISE_SIGMA = 1.0
 SEED = 42
@@ -25,17 +25,15 @@ N_DLNF = 11
 DLNF_MIN = 0.0
 DLNF_MAX = 0.05
 
-# ── Fixed EMRI parameters (not predicted) ───────────────────────────
+# ── Fixed EMRI parameters ───────────────────────────────────────────
 T_C = 1e6
 A0 = 5.0
 N_HARMONICS = 4
+CHIRP_MASS = 1.0
+HARMONIC_DECAY = 1.5
 
-# ── Predicted parameters and their ranges ───────────────────────────
-PARAM_RANGES = {
-    "f0": (5e-4, 5e-3),
-    "chirp_mass": (0.5, 2.0),
-    "harmonic_decay": (0.5, 3.0),
-}
+# ── Predicted parameter ─────────────────────────────────────────────
+F0_MIN, F0_MAX = 2.74975e-3, 2.75025e-3  # 0.5 µHz range around 2.75 mHz
 
 # ── Transformer architecture ────────────────────────────────────────
 D_MODEL = 64
@@ -43,6 +41,9 @@ N_HEADS = 4
 N_LAYERS = 3
 D_FF = 256
 DROPOUT = 0.1
+
+# ── Ablation ─────────────────────────────────────────────────────────
+MASK_PHASES = False  # set True to zero out phase features
 
 # ── Training ────────────────────────────────────────────────────────
 BATCH_SIZE = 64
@@ -55,28 +56,22 @@ N_EPOCHS = 80
 # =====================================================================
 
 def generate_dataset(n_signals, rng):
-    """Generate EMRI signals with random parameters.
+    """Generate EMRI signals with random f0.
 
-    Returns (signals, params) where signals has shape (n, N) and
-    params has shape (n, 3) with columns [f0, chirp_mass, harmonic_decay].
+    Returns (signals, f0s) where signals is (n, N) and f0s is (n,).
     """
-    params = np.zeros((n_signals, 3))
+    f0s = rng.uniform(F0_MIN, F0_MAX, size=n_signals)
     signals = np.zeros((n_signals, N))
 
     for i in range(n_signals):
-        f0 = rng.uniform(*PARAM_RANGES["f0"])
-        chirp_mass = rng.uniform(*PARAM_RANGES["chirp_mass"])
-        harmonic_decay = rng.uniform(*PARAM_RANGES["harmonic_decay"])
-
-        params[i] = [f0, chirp_mass, harmonic_decay]
         signals[i] = emri_signal(
-            f0=f0, chirp_mass=chirp_mass, t_c=T_C, A0=A0,
-            harmonic_decay=harmonic_decay, n_harmonics=N_HARMONICS, N=N,
+            f0=f0s[i], chirp_mass=CHIRP_MASS, t_c=T_C, A0=A0,
+            harmonic_decay=HARMONIC_DECAY, n_harmonics=N_HARMONICS, N=N,
         )
         if (i + 1) % 100 == 0:
             print(f"  {i + 1}/{n_signals}")
 
-    return signals, params
+    return signals, f0s
 
 
 # =====================================================================
@@ -86,8 +81,8 @@ def generate_dataset(n_signals, rng):
 def tokenize_signals(signals, device):
     """Convert raw signals to token features.
 
-    Returns Tensor of shape (n_signals, N_WINDOWS, N_PEAKS * 5).
-    Features per peak: [freq, dlnf, log_amplitude, phi_0, phi_1].
+    Returns Tensor of shape (n_signals, N_WINDOWS, N_PEAKS * 7).
+    Features per peak: [freq, dlnf, log_amp, cos_phi0, sin_phi0, cos_phi1, sin_phi1].
     """
     decomposer = SpectralDecomposer(k=K_WINDOW).to(device)
     dlnf_grid = torch.linspace(DLNF_MIN, DLNF_MAX, N_DLNF, device=device)
@@ -109,11 +104,19 @@ def tokenize_signals(signals, device):
             freq_refined,
             dlnf_refined,
             torch.log1p(peak_vals),
-            torch.remainder(phi_0, 2 * torch.pi),
-            torch.remainder(phi_1, 2 * torch.pi),
-        ], dim=-1)  # (N_WINDOWS, K, 5)
+            torch.cos(phi_0),
+            torch.sin(phi_0),
+            torch.cos(phi_1),
+            torch.sin(phi_1),
+        ], dim=-1)  # (N_WINDOWS, K, 7)
 
-        features = features.reshape(features.shape[0], -1)  # (N_WINDOWS, K*5)
+        features = features.reshape(features.shape[0], -1)  # (N_WINDOWS, K*7)
+
+        if MASK_PHASES:
+            # Zero out cos/sin phase columns (indices 3,4,5,6 per peak)
+            for p in range(N_PEAKS):
+                features[:, p * 7 + 3 : p * 7 + 7] = 0.0
+
         all_tokens.append(features)
 
         if (i + 1) % 100 == 0:
@@ -133,32 +136,20 @@ def normalize_tokens(tokens, mean, std):
     return (tokens - mean) / std
 
 
-def normalize_params(params):
-    mins = np.array([v[0] for v in PARAM_RANGES.values()])
-    maxs = np.array([v[1] for v in PARAM_RANGES.values()])
-    return (params - mins) / (maxs - mins)
-
-
-def denormalize_params(params_norm):
-    mins = np.array([v[0] for v in PARAM_RANGES.values()])
-    maxs = np.array([v[1] for v in PARAM_RANGES.values()])
-    return params_norm * (maxs - mins) + mins
-
-
 # =====================================================================
 # Dataset
 # =====================================================================
 
 class EMRITokenDataset(Dataset):
-    def __init__(self, tokens, params):
+    def __init__(self, tokens, targets):
         self.tokens = tokens
-        self.params = params
+        self.targets = targets
 
     def __len__(self):
         return len(self.tokens)
 
     def __getitem__(self, idx):
-        return self.tokens[idx], self.params[idx]
+        return self.tokens[idx], self.targets[idx]
 
 
 # =====================================================================
@@ -166,14 +157,14 @@ class EMRITokenDataset(Dataset):
 # =====================================================================
 
 class EMRITransformer(nn.Module):
-    """Encoder-only transformer for EMRI parameter regression.
+    """Encoder-only transformer for f0 regression.
 
-    Input projection → positional encoding → TransformerEncoder →
-    global average pool → MLP head → Sigmoid (outputs in [0, 1]).
+    Input projection -> positional encoding -> TransformerEncoder ->
+    global average pool -> MLP head -> Sigmoid (output in [0, 1]).
     """
 
     def __init__(self, n_features, seq_len, d_model, n_heads, n_layers,
-                 d_ff, n_params, dropout=0.1):
+                 d_ff, dropout=0.1):
         super().__init__()
         self.input_proj = nn.Linear(n_features, d_model)
         self.pos_encoding = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
@@ -189,7 +180,7 @@ class EMRITransformer(nn.Module):
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, n_params),
+            nn.Linear(d_model, 1),
             nn.Sigmoid(),
         )
 
@@ -197,7 +188,7 @@ class EMRITransformer(nn.Module):
         x = self.input_proj(x) + self.pos_encoding
         x = self.encoder(x)
         x = x.mean(dim=1)
-        return self.head(x)
+        return self.head(x).squeeze(-1)
 
 
 # =====================================================================
@@ -213,10 +204,10 @@ def train(model, train_loader, val_loader, device, n_epochs, lr):
     for epoch in range(n_epochs):
         model.train()
         epoch_loss, n_batches = 0.0, 0
-        for tokens, params in train_loader:
-            tokens, params = tokens.to(device), params.to(device)
+        for tokens, targets in train_loader:
+            tokens, targets = tokens.to(device), targets.to(device)
             pred = model(tokens)
-            loss = F.mse_loss(pred, params)
+            loss = F.mse_loss(pred, targets)
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -228,9 +219,9 @@ def train(model, train_loader, val_loader, device, n_epochs, lr):
         model.eval()
         val_loss, n_val = 0.0, 0
         with torch.no_grad():
-            for tokens, params in val_loader:
-                tokens, params = tokens.to(device), params.to(device)
-                val_loss += F.mse_loss(model(tokens), params).item()
+            for tokens, targets in val_loader:
+                tokens, targets = tokens.to(device), targets.to(device)
+                val_loss += F.mse_loss(model(tokens), targets).item()
                 n_val += 1
         val_losses.append(val_loss / n_val)
 
@@ -247,18 +238,29 @@ def train(model, train_loader, val_loader, device, n_epochs, lr):
 # Evaluation and plotting
 # =====================================================================
 
-def evaluate_and_plot(model, val_loader, train_losses, val_losses, device):
+def evaluate_and_plot(model, val_loader, val_f0, train_losses, val_losses, device):
     model.eval()
-    all_pred, all_true = [], []
+    all_pred = []
     with torch.no_grad():
-        for tokens, params in val_loader:
+        for tokens, _ in val_loader:
             all_pred.append(model(tokens.to(device)).cpu())
-            all_true.append(params)
 
-    pred = denormalize_params(torch.cat(all_pred).numpy())
-    true = denormalize_params(torch.cat(all_true).numpy())
+    pred_norm = torch.cat(all_pred).numpy()
+    pred_f0 = pred_norm * (F0_MAX - F0_MIN) + F0_MIN
+    true_f0 = val_f0
 
-    param_labels = ["$f_0$ (Hz)", "chirp mass", "harmonic decay"]
+    abs_err = np.abs(pred_f0 - true_f0)
+    rel_err = abs_err / true_f0
+
+    ss_res = np.sum((true_f0 - pred_f0) ** 2)
+    ss_tot = np.sum((true_f0 - true_f0.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot
+    med_rel = np.median(rel_err)
+    med_abs = np.median(abs_err)
+
+    print(f"\n  R² = {r2:.6f}")
+    print(f"  Median absolute error: {med_abs:.2e} Hz")
+    print(f"  Median relative error: {med_rel:.4%}")
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
@@ -272,24 +274,38 @@ def evaluate_and_plot(model, val_loader, train_losses, val_losses, device):
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Scatter plots
-    for i, (ax, name, label) in enumerate(zip(
-            [axes[0, 1], axes[1, 0], axes[1, 1]],
-            PARAM_RANGES.keys(), param_labels)):
-        ax.scatter(true[:, i], pred[:, i], s=5, alpha=0.5)
-        lo, hi = PARAM_RANGES[name]
-        ax.plot([lo, hi], [lo, hi], "r--", lw=1, label="perfect")
+    # Predicted vs true
+    ax = axes[0, 1]
+    ax.scatter(true_f0 * 1e3, pred_f0 * 1e3, s=5, alpha=0.5)
+    ax.plot([F0_MIN * 1e3, F0_MAX * 1e3], [F0_MIN * 1e3, F0_MAX * 1e3],
+            "r--", lw=1, label="perfect")
+    ax.set_xlabel("True $f_0$ (mHz)")
+    ax.set_ylabel("Predicted $f_0$ (mHz)")
+    ax.set_title(f"$f_0$:  R²={r2:.6f},  median rel. err={med_rel:.4%}")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 
-        ss_res = np.sum((true[:, i] - pred[:, i]) ** 2)
-        ss_tot = np.sum((true[:, i] - true[:, i].mean()) ** 2)
-        r2 = 1 - ss_res / ss_tot
-        med_rel = np.median(np.abs(pred[:, i] - true[:, i]) / np.abs(true[:, i]))
+    # Relative error vs f0
+    ax = axes[1, 0]
+    ax.scatter(true_f0 * 1e3, rel_err * 100, s=5, alpha=0.5)
+    ax.axhline(med_rel * 100, color="r", ls="--", lw=1,
+               label=f"median: {med_rel:.4%}")
+    ax.set_xlabel("True $f_0$ (mHz)")
+    ax.set_ylabel("Relative error (%)")
+    ax.set_title("Relative error vs $f_0$")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 
-        ax.set_xlabel(f"True {label}")
-        ax.set_ylabel(f"Predicted {label}")
-        ax.set_title(f"{label}:  R²={r2:.3f},  median rel. err={med_rel:.1%}")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+    # Histogram of relative errors
+    ax = axes[1, 1]
+    ax.hist(rel_err * 100, bins=50, alpha=0.7, color="steelblue")
+    ax.axvline(med_rel * 100, color="r", ls="--", lw=2,
+               label=f"median: {med_rel:.4%}")
+    ax.set_xlabel("Relative error (%)")
+    ax.set_ylabel("Count")
+    ax.set_title("Error distribution")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig("transformer_demo.png", dpi=150)
@@ -308,11 +324,11 @@ if __name__ == "__main__":
     # 1. Generate signals
     print(f"Generating {N_TRAIN + N_VAL} EMRI signals...")
     t0 = time.time()
-    all_signals, all_params = generate_dataset(N_TRAIN + N_VAL, rng)
+    all_signals, all_f0s = generate_dataset(N_TRAIN + N_VAL, rng)
     print(f"  Done in {time.time() - t0:.1f}s")
 
     train_signals, val_signals = all_signals[:N_TRAIN], all_signals[N_TRAIN:]
-    train_params, val_params = all_params[:N_TRAIN], all_params[N_TRAIN:]
+    train_f0, val_f0 = all_f0s[:N_TRAIN], all_f0s[N_TRAIN:]
 
     # 2. Add noise
     if NOISE_SIGMA > 0:
@@ -332,23 +348,25 @@ if __name__ == "__main__":
     train_tokens = normalize_tokens(train_tokens, tok_mean, tok_std).cpu()
     val_tokens = normalize_tokens(val_tokens, tok_mean, tok_std).cpu()
 
-    train_params_norm = torch.from_numpy(normalize_params(train_params)).float()
-    val_params_norm = torch.from_numpy(normalize_params(val_params)).float()
+    # Min-max normalize f0 to [0, 1]
+    train_targets = torch.from_numpy(
+        (train_f0 - F0_MIN) / (F0_MAX - F0_MIN)).float()
+    val_targets = torch.from_numpy(
+        (val_f0 - F0_MIN) / (F0_MAX - F0_MIN)).float()
 
     # 5. Data loaders
     train_loader = DataLoader(
-        EMRITokenDataset(train_tokens, train_params_norm),
+        EMRITokenDataset(train_tokens, train_targets),
         batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(
-        EMRITokenDataset(val_tokens, val_params_norm),
+        EMRITokenDataset(val_tokens, val_targets),
         batch_size=BATCH_SIZE)
 
     # 6. Model
     seq_len = train_tokens.shape[1]
     model = EMRITransformer(
-        n_features=N_PEAKS * 5, seq_len=seq_len, d_model=D_MODEL,
-        n_heads=N_HEADS, n_layers=N_LAYERS, d_ff=D_FF,
-        n_params=len(PARAM_RANGES), dropout=DROPOUT,
+        n_features=N_PEAKS * 7, seq_len=seq_len, d_model=D_MODEL,
+        n_heads=N_HEADS, n_layers=N_LAYERS, d_ff=D_FF, dropout=DROPOUT,
     ).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -358,4 +376,4 @@ if __name__ == "__main__":
         model, train_loader, val_loader, device, N_EPOCHS, LR)
 
     # 8. Evaluate and plot
-    evaluate_and_plot(model, val_loader, train_losses, val_losses, device)
+    evaluate_and_plot(model, val_loader, val_f0, train_losses, val_losses, device)
