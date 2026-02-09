@@ -9,6 +9,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
+import jax
+jax.config.update("jax_enable_x64", True)
+
 from spectral_tokens import SpectralDecomposer, emri_signal
 
 # ── Signal parameters ────────────────────────────────────────────────
@@ -33,7 +36,9 @@ CHIRP_MASS = 1.0
 HARMONIC_DECAY = 1.5
 
 # ── Predicted parameter ─────────────────────────────────────────────
-F0_MIN, F0_MAX = 2.74975e-3, 2.75025e-3  # 0.5 µHz range around 2.75 mHz
+F0_CENTER = 2.75e-3
+F0_HALF = 1.5e-8                          # 30 nHz half-width (near token info floor for k=1024)
+F0_MIN, F0_MAX = F0_CENTER - F0_HALF, F0_CENTER + F0_HALF
 
 # ── Transformer architecture ────────────────────────────────────────
 D_MODEL = 64
@@ -48,7 +53,7 @@ MASK_PHASES = False  # set True to zero out phase features
 # ── Training ────────────────────────────────────────────────────────
 BATCH_SIZE = 64
 LR = 1e-3
-N_EPOCHS = 80
+N_EPOCHS = 200
 
 
 # =====================================================================
@@ -81,16 +86,17 @@ def generate_dataset(n_signals, rng):
 def tokenize_signals(signals, device):
     """Convert raw signals to token features.
 
-    Returns Tensor of shape (n_signals, N_WINDOWS, N_PEAKS * 7).
-    Features per peak: [freq, dlnf, log_amp, cos_phi0, sin_phi0, cos_phi1, sin_phi1].
+    Returns Tensor of shape (n_signals, N_WINDOWS, N_PEAKS * 7 + N_PEAKS * 2).
+    Per-peak features: [freq, dlnf, log_amp, cos_phi0, sin_phi0, cos_phi1, sin_phi1].
+    Plus inter-window phase residual features (cos/sin) appended per peak.
     """
-    decomposer = SpectralDecomposer(k=K_WINDOW).to(device)
-    dlnf_grid = torch.linspace(DLNF_MIN, DLNF_MAX, N_DLNF, device=device)
+    decomposer = SpectralDecomposer(k=K_WINDOW).double().to(device)
+    dlnf_grid = torch.linspace(DLNF_MIN, DLNF_MAX, N_DLNF, device=device, dtype=torch.float64)
 
     all_tokens = []
 
     for i in range(len(signals)):
-        x = torch.from_numpy(signals[i]).float().to(device)
+        x = torch.from_numpy(signals[i]).double().to(device)
 
         X = decomposer(x, dlnf=dlnf_grid)  # (D, N_WINDOWS, k)
 
@@ -100,6 +106,12 @@ def tokenize_signals(signals, device):
         phi_0, phi_1 = decomposer.peak_phases(
             X, peaks, freq_refined, dlnf_refined, dlnf_grid)
 
+        # Inter-window phase residual: phi_0[w+1] - phi_1[w]
+        # Measures phase coherence — deviations encode frequency errors
+        residual = phi_0[1:] - phi_1[:-1]  # (N_WINDOWS-1, K)
+        # Pad first window with zeros (no previous window to compare)
+        residual = torch.cat([torch.zeros_like(residual[:1]), residual], dim=0)
+
         features = torch.stack([
             freq_refined,
             dlnf_refined,
@@ -108,21 +120,23 @@ def tokenize_signals(signals, device):
             torch.sin(phi_0),
             torch.cos(phi_1),
             torch.sin(phi_1),
-        ], dim=-1)  # (N_WINDOWS, K, 7)
+            torch.cos(residual),
+            torch.sin(residual),
+        ], dim=-1)  # (N_WINDOWS, K, 9)
 
-        features = features.reshape(features.shape[0], -1)  # (N_WINDOWS, K*7)
+        features = features.reshape(features.shape[0], -1)  # (N_WINDOWS, K*9)
 
         if MASK_PHASES:
-            # Zero out cos/sin phase columns (indices 3,4,5,6 per peak)
+            # Zero out phase columns (indices 3-8 per peak)
             for p in range(N_PEAKS):
-                features[:, p * 7 + 3 : p * 7 + 7] = 0.0
+                features[:, p * 9 + 3 : p * 9 + 9] = 0.0
 
         all_tokens.append(features)
 
         if (i + 1) % 100 == 0:
             print(f"  {i + 1}/{len(signals)}")
 
-    return torch.stack(all_tokens)  # (n_signals, N_WINDOWS, K*5)
+    return torch.stack(all_tokens)
 
 
 def compute_normalization(tokens):
@@ -350,9 +364,9 @@ if __name__ == "__main__":
 
     # Min-max normalize f0 to [0, 1]
     train_targets = torch.from_numpy(
-        (train_f0 - F0_MIN) / (F0_MAX - F0_MIN)).float()
+        (train_f0 - F0_MIN) / (F0_MAX - F0_MIN)).double()
     val_targets = torch.from_numpy(
-        (val_f0 - F0_MIN) / (F0_MAX - F0_MIN)).float()
+        (val_f0 - F0_MIN) / (F0_MAX - F0_MIN)).double()
 
     # 5. Data loaders
     train_loader = DataLoader(
@@ -365,9 +379,9 @@ if __name__ == "__main__":
     # 6. Model
     seq_len = train_tokens.shape[1]
     model = EMRITransformer(
-        n_features=N_PEAKS * 7, seq_len=seq_len, d_model=D_MODEL,
+        n_features=N_PEAKS * 9, seq_len=seq_len, d_model=D_MODEL,
         n_heads=N_HEADS, n_layers=N_LAYERS, d_ff=D_FF, dropout=DROPOUT,
-    ).to(device)
+    ).double().to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # 7. Train
