@@ -48,7 +48,9 @@ D_FF = 256
 DROPOUT = 0.1
 
 # ── Ablation ─────────────────────────────────────────────────────────
-MASK_PHASES = False  # set True to zero out phase features
+MASK_PHASES = False          # zero out ALL phase features (indices 3-8)
+MASK_PHI1_RESIDUAL = False   # zero out phi_1 + residual (indices 5-8), keep phi_0
+MASK_RESIDUAL = False        # zero out only residual (indices 7-8), keep phi_0/phi_1
 
 # ── Training ────────────────────────────────────────────────────────
 BATCH_SIZE = 64
@@ -127,9 +129,17 @@ def tokenize_signals(signals, device):
         features = features.reshape(features.shape[0], -1)  # (N_WINDOWS, K*9)
 
         if MASK_PHASES:
-            # Zero out phase columns (indices 3-8 per peak)
+            # Zero out ALL phase columns (indices 3-8 per peak)
             for p in range(N_PEAKS):
                 features[:, p * 9 + 3 : p * 9 + 9] = 0.0
+        elif MASK_PHI1_RESIDUAL:
+            # Zero out phi_1 + residual columns (indices 5-8 per peak)
+            for p in range(N_PEAKS):
+                features[:, p * 9 + 5 : p * 9 + 9] = 0.0
+        elif MASK_RESIDUAL:
+            # Zero out only residual columns (indices 7-8 per peak)
+            for p in range(N_PEAKS):
+                features[:, p * 9 + 7 : p * 9 + 9] = 0.0
 
         all_tokens.append(features)
 
