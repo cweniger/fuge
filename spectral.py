@@ -258,6 +258,7 @@ class SpectralDecomposer(nn.Module):
 
     def peak_phases(self, X: torch.Tensor, peaks: torch.Tensor,
                     freq_refined: torch.Tensor, dlnf_refined: torch.Tensor,
+                    dlnf_grid: torch.Tensor,
                     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Estimate phase at hop boundaries for each detected peak.
 
@@ -265,15 +266,22 @@ class SpectralDecomposer(nn.Module):
         the fractional-bin offset (Hann-window phase centre), then
         propagates the phase forward by one hop accounting for the chirp.
 
+        The de-chirp resampling shifts the apparent frequency:
+            f_dechirped = f_original * (exp(2*dlnf) - 1) / (2*dlnf)
+        so freq_refined must be converted back to f_original before
+        computing the phase increment.
+
         Parameters
         ----------
         X : complex Tensor, shape (D, N_WINDOWS, k)
         peaks : LongTensor, shape (N_WINDOWS, K, 2)
             Integer (dlnf_idx, freq_idx) from find_peaks.
         freq_refined : Tensor, shape (N_WINDOWS, K)
-            Fractional frequency bin index.
+            Fractional frequency bin index (in de-chirped domain).
         dlnf_refined : Tensor, shape (N_WINDOWS, K)
-            Interpolated dlnf value.
+            Interpolated dlnf value (true chirp rate).
+        dlnf_grid : Tensor, shape (D,)
+            The dlnf grid used for de-chirping.
 
         Returns
         -------
@@ -296,10 +304,24 @@ class SpectralDecomposer(nn.Module):
         f_delta = freq_refined - freq_idx.float()
         phi_start = X_peak.angle() - torch.pi * f_delta * (self.k - 1) / self.k
 
-        # Phase increment over one hop:
-        # integral_0^{T_hop} 2*pi*f(t) dt  where f(t) = f0*exp(dlnf*t/T_hop)
-        # = pi * f_bin * (exp(dlnf) - 1) / dlnf
-        # (using f_hz * T_hop = f_bin * hop/k = f_bin / 2)
+        # --- Convert de-chirped freq to original freq at window start ---
+        # De-chirping with beta = 2*dlnf_used maps f_original to
+        # f_dechirp = f_original * (exp(beta) - 1) / beta
+        # so f_original = f_dechirp * beta / (exp(beta) - 1)
+        dlnf_used = dlnf_grid[dlnf_idx]                     # (W, K)
+        beta = 2.0 * dlnf_used
+        safe_beta = torch.where(beta.abs() < 1e-8,
+                                 torch.ones_like(beta) * 1e-8, beta)
+        freq_correction = safe_beta / (torch.exp(safe_beta) - 1.0)
+        freq_correction = torch.where(beta.abs() < 1e-8,
+                                       torch.ones_like(freq_correction),
+                                       freq_correction)
+        f0_bin = freq_refined * freq_correction              # original freq in bins
+
+        # --- Phase increment over one hop ---
+        # integral_0^{T_hop} 2*pi * f0 * exp(dlnf_true * t/T_hop) dt
+        # = pi * f0_bin * (exp(dlnf_true) - 1) / dlnf_true
+        # (using f0_hz * T_hop = f0_bin / 2)
         dl = dlnf_refined
         safe_dl = torch.where(dl.abs() < 1e-10,
                                torch.ones_like(dl) * 1e-10, dl)
@@ -307,7 +329,7 @@ class SpectralDecomposer(nn.Module):
         chirp_factor = torch.where(dl.abs() < 1e-10,
                                     torch.ones_like(chirp_factor), chirp_factor)
 
-        phase_inc = torch.pi * freq_refined * chirp_factor
+        phase_inc = torch.pi * f0_bin * chirp_factor
 
         return phi_start, phi_start + phase_inc
 
@@ -394,81 +416,86 @@ if __name__ == "__main__":
     print("Saved spectral_demo.png")
 
     # --- Phase continuity demo (peaks_demo.png) ---
-    # Use sigma=5: 3rd harmonic is borderline, good for showing phase breakdown.
-    sigma = 5.0
-    noise = np.random.default_rng(42).standard_normal(N) * sigma
-    x = torch.from_numpy((h + noise)).float().to(device)
-    X_grid = decomposer(x, dlnf=dlnf_grid)
-
+    phase_sigmas = [1.0, 5.0]
     n_windows = (N - k) // (k // 2) + 1
     t_centers = (np.arange(n_windows) * decomposer.hop + k / 2) / fs
     f_bins = np.arange(k // 2 + 1) * fs / k
-    amp_zero = X_grid[0].abs().cpu().numpy()[:, :k // 2 + 1]
-    snr = amp_zero / (noise_rms * sigma)
-
-    peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
-        X_grid, K=3, dlnf_grid=dlnf_grid)
-    phi_0, phi_1 = decomposer.peak_phases(
-        X_grid, peaks, freq_refined, dlnf_refined)
-
-    # Phase residual: wrap(phi_0[w+1] - phi_1[w]) for consecutive windows
-    residual = phi_0[1:] - phi_1[:-1]                 # (W-1, K)
-    residual = ((residual + torch.pi) % (2 * torch.pi)) - torch.pi  # wrap to [-pi, pi]
-    residual_np = residual.cpu().numpy()               # (W-1, K)
-    t_res = 0.5 * (t_centers[:-1] + t_centers[1:])    # midpoints
-
-    f_peak = freq_refined.cpu().numpy() * fs / k
-    dlnf_peak = dlnf_refined.cpu().numpy()
     dt_half = decomposer.hop / fs / 2
-
-    # Per-segment phase residual magnitude for coloring (W-1 values; pad last)
-    res_abs = np.abs(residual_np)                       # (W-1, K)
-    res_pad = np.concatenate([res_abs, res_abs[-1:]], axis=0)  # (W, K)
     norm = Normalize(vmin=0, vmax=np.pi)
-
-    fig2, (ax_spec, ax_res) = plt.subplots(
-        2, 1, figsize=(12, 6), height_ratios=[2, 1], sharex=True)
-
-    # -- Top: spectrogram with slope lines coloured by phase residual --
-    im = ax_spec.pcolormesh(t_centers, f_bins, snr.T, shading="nearest",
-                             cmap="inferno", vmin=0, vmax=30)
-    ax_spec.set_yscale("log")
-    ax_spec.set_ylim(params["f0"] * 0.5,
-                      params["f0"] * (params["n_harmonics"] + 1) * 5)
-
-    cmap_phase = plt.cm.RdYlGn_r   # green = 0, red = pi
-    for ki in range(3):
-        segments = []
-        colors = []
-        for wi in range(n_windows):
-            fc, dl, tc = f_peak[wi, ki], dlnf_peak[wi, ki], t_centers[wi]
-            segments.append([(tc - dt_half, fc * np.exp(-dl / 2)),
-                             (tc + dt_half, fc * np.exp(dl / 2))])
-            colors.append(cmap_phase(norm(res_pad[wi, ki])))
-        lc = LineCollection(segments, colors=colors, linewidths=1.0,
-                            capstyle="round")
-        ax_spec.add_collection(lc)
-
-    sm = plt.cm.ScalarMappable(cmap=cmap_phase, norm=norm)
-    fig2.colorbar(sm, ax=ax_spec, label="|Δφ| (rad)")
-    fig2.colorbar(im, ax=ax_spec, label="SNR", location="left")
-    ax_spec.set_ylabel("f (Hz)")
-    ax_spec.set_title(f"Phase continuity (σ = {sigma}): "
-                       "green = coherent, red = lost")
-
-    # -- Bottom: wrapped phase residual vs time --
+    cmap_phase = plt.cm.RdYlGn_r
     labels = ["fundamental", "2nd harmonic", "3rd harmonic"]
     colors_line = ["#1f77b4", "#ff7f0e", "#2ca02c"]
-    for ki in range(3):
-        ax_res.scatter(t_res, residual_np[:, ki], s=3, alpha=0.6,
-                        color=colors_line[ki], label=labels[ki])
-    ax_res.axhline(0, color="gray", lw=0.5, ls="--")
-    ax_res.set_ylim(-np.pi * 1.1, np.pi * 1.1)
-    ax_res.set_ylabel("Δφ (rad)")
-    ax_res.set_xlabel("t (s)")
-    ax_res.legend(loc="upper left", fontsize=8, ncol=3)
-    ax_res.set_title("Phase residual:  φ₀(w+1) − φ₁(w)")
 
+    fig2, axes2 = plt.subplots(
+        len(phase_sigmas) * 2, 1, figsize=(12, 5 * len(phase_sigmas)),
+        height_ratios=[2, 1] * len(phase_sigmas),
+        sharex=True)
+
+    for si, sigma in enumerate(phase_sigmas):
+        ax_spec = axes2[si * 2]
+        ax_res = axes2[si * 2 + 1]
+
+        noise = np.random.default_rng(42).standard_normal(N) * sigma
+        x = torch.from_numpy((h + noise)).float().to(device)
+        X_grid = decomposer(x, dlnf=dlnf_grid)
+
+        amp_zero = X_grid[0].abs().cpu().numpy()[:, :k // 2 + 1]
+        snr = amp_zero / (noise_rms * sigma)
+
+        peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
+            X_grid, K=3, dlnf_grid=dlnf_grid)
+        phi_0, phi_1 = decomposer.peak_phases(
+            X_grid, peaks, freq_refined, dlnf_refined, dlnf_grid)
+
+        # Phase residual: wrap(phi_0[w+1] - phi_1[w])
+        residual = phi_0[1:] - phi_1[:-1]
+        residual = ((residual + torch.pi) % (2 * torch.pi)) - torch.pi
+        residual_np = residual.cpu().numpy()
+        t_res = 0.5 * (t_centers[:-1] + t_centers[1:])
+
+        f_peak = freq_refined.cpu().numpy() * fs / k
+        dlnf_peak = dlnf_refined.cpu().numpy()
+
+        res_abs = np.abs(residual_np)
+        res_pad = np.concatenate([res_abs, res_abs[-1:]], axis=0)
+
+        # -- Spectrogram with coloured slope lines --
+        im = ax_spec.pcolormesh(t_centers, f_bins, snr.T, shading="nearest",
+                                 cmap="inferno", vmin=0, vmax=30)
+        ax_spec.set_yscale("log")
+        ax_spec.set_ylim(params["f0"] * 0.5,
+                          params["f0"] * (params["n_harmonics"] + 1) * 5)
+
+        for ki in range(3):
+            segments, colors = [], []
+            for wi in range(n_windows):
+                fc, dl, tc = f_peak[wi, ki], dlnf_peak[wi, ki], t_centers[wi]
+                segments.append([(tc - dt_half, fc * np.exp(-dl / 2)),
+                                 (tc + dt_half, fc * np.exp(dl / 2))])
+                colors.append(cmap_phase(norm(res_pad[wi, ki])))
+            lc = LineCollection(segments, colors=colors, linewidths=1.0,
+                                capstyle="round")
+            ax_spec.add_collection(lc)
+
+        sm = plt.cm.ScalarMappable(cmap=cmap_phase, norm=norm)
+        fig2.colorbar(sm, ax=ax_spec, label="|Δφ| (rad)")
+        fig2.colorbar(im, ax=ax_spec, label="SNR", location="left")
+        ax_spec.set_ylabel("f (Hz)")
+        ax_spec.set_title(f"Phase continuity (σ = {sigma}): "
+                           "green = coherent, red = lost")
+
+        # -- Phase residual scatter --
+        for ki in range(3):
+            ax_res.scatter(t_res, residual_np[:, ki], s=3, alpha=0.6,
+                            color=colors_line[ki], label=labels[ki])
+        ax_res.axhline(0, color="gray", lw=0.5, ls="--")
+        ax_res.set_ylim(-np.pi * 1.1, np.pi * 1.1)
+        ax_res.set_ylabel("Δφ (rad)")
+        ax_res.set_title(f"Phase residual (σ = {sigma}):  φ₀(w+1) − φ₁(w)")
+        if si == 0:
+            ax_res.legend(loc="upper left", fontsize=8, ncol=3)
+
+    axes2[-1].set_xlabel("t (s)")
     plt.tight_layout()
     plt.savefig("peaks_demo.png", dpi=150)
     print("Saved peaks_demo.png")
