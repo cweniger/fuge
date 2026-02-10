@@ -47,10 +47,9 @@ N_LAYERS = 3
 D_FF = 256
 DROPOUT = 0.1
 
-# ── Ablation ─────────────────────────────────────────────────────────
-MASK_PHASES = False          # zero out ALL phase features (indices 3-8)
-MASK_PHI1_RESIDUAL = False   # zero out phi_1 + residual (indices 5-8), keep phi_0
-MASK_RESIDUAL = False        # zero out only residual (indices 7-8), keep phi_0/phi_1
+# ── Embedding ────────────────────────────────────────────────────────
+PHASE_MODE = "center"        # "center" or "boundary"
+MASK_PHASES = False          # zero out phase features (for ablation)
 
 # ── Training ────────────────────────────────────────────────────────
 BATCH_SIZE = 64
@@ -86,11 +85,10 @@ def generate_dataset(n_signals, rng):
 # =====================================================================
 
 def tokenize_signals(signals, device):
-    """Convert raw signals to token features.
+    """Convert raw signals to raw token values.
 
-    Returns Tensor of shape (n_signals, N_WINDOWS, N_PEAKS * 7 + N_PEAKS * 2).
-    Per-peak features: [freq, dlnf, log_amp, cos_phi0, sin_phi0, cos_phi1, sin_phi1].
-    Plus inter-window phase residual features (cos/sin) appended per peak.
+    Returns 5 raw values per peak: [freq, dlnf, amp, phase_start, phase_end].
+    No cos/sin or log transforms — those belong in the embedding layer.
     """
     decomposer = SpectralDecomposer(k=K_WINDOW).double().to(device)
     dlnf_grid = torch.linspace(DLNF_MIN, DLNF_MAX, N_DLNF, device=device, dtype=torch.float64)
@@ -105,59 +103,20 @@ def tokenize_signals(signals, device):
         peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
             X, K=N_PEAKS, dlnf_grid=dlnf_grid)
 
-        phi_0, phi_1 = decomposer.peak_phases(
+        phase_start, phase_end = decomposer.peak_phases(
             X, peaks, freq_refined, dlnf_refined, dlnf_grid)
 
-        # Inter-window phase residual: phi_0[w+1] - phi_1[w]
-        # Measures phase coherence — deviations encode frequency errors
-        residual = phi_0[1:] - phi_1[:-1]  # (N_WINDOWS-1, K)
-        # Pad first window with zeros (no previous window to compare)
-        residual = torch.cat([torch.zeros_like(residual[:1]), residual], dim=0)
-
         features = torch.stack([
-            freq_refined,
-            dlnf_refined,
-            torch.log1p(peak_vals),
-            torch.cos(phi_0),
-            torch.sin(phi_0),
-            torch.cos(phi_1),
-            torch.sin(phi_1),
-            torch.cos(residual),
-            torch.sin(residual),
-        ], dim=-1)  # (N_WINDOWS, K, 9)
+            freq_refined, dlnf_refined, peak_vals, phase_start, phase_end,
+        ], dim=-1)  # (N_WINDOWS, K, 5)
 
-        features = features.reshape(features.shape[0], -1)  # (N_WINDOWS, K*9)
-
-        if MASK_PHASES:
-            # Zero out ALL phase columns (indices 3-8 per peak)
-            for p in range(N_PEAKS):
-                features[:, p * 9 + 3 : p * 9 + 9] = 0.0
-        elif MASK_PHI1_RESIDUAL:
-            # Zero out phi_1 + residual columns (indices 5-8 per peak)
-            for p in range(N_PEAKS):
-                features[:, p * 9 + 5 : p * 9 + 9] = 0.0
-        elif MASK_RESIDUAL:
-            # Zero out only residual columns (indices 7-8 per peak)
-            for p in range(N_PEAKS):
-                features[:, p * 9 + 7 : p * 9 + 9] = 0.0
-
+        features = features.reshape(features.shape[0], -1)  # (N_WINDOWS, K*5)
         all_tokens.append(features)
 
         if (i + 1) % 100 == 0:
             print(f"  {i + 1}/{len(signals)}")
 
     return torch.stack(all_tokens)
-
-
-def compute_normalization(tokens):
-    flat = tokens.reshape(-1, tokens.shape[-1])
-    mean = flat.mean(dim=0)
-    std = flat.std(dim=0).clamp(min=1e-8)
-    return mean, std
-
-
-def normalize_tokens(tokens, mean, std):
-    return (tokens - mean) / std
 
 
 # =====================================================================
@@ -177,20 +136,82 @@ class EMRITokenDataset(Dataset):
 
 
 # =====================================================================
-# Transformer model
+# Embedding + Transformer model
 # =====================================================================
 
-class EMRITransformer(nn.Module):
-    """Encoder-only transformer for f0 regression.
+class TokenEmbedding(nn.Module):
+    """Embed raw token values into model-ready features.
 
-    Input projection -> positional encoding -> TransformerEncoder ->
+    Raw tokens: 5 values per peak [freq, dlnf, amp, phase_start, phase_end].
+    Applies cos/sin to phases, log1p to amplitude, then z-score normalizes.
+
+    PHASE_MODE == "center":   uses (phase_start + phase_end) / 2 → 5 embedded features/peak
+    PHASE_MODE == "boundary": uses phase_start and phase_end   → 7 embedded features/peak
+    """
+
+    N_FEAT = {"center": 5, "boundary": 7}
+
+    def __init__(self, n_peaks, phase_mode="center", mask_phases=False):
+        super().__init__()
+        self.n_peaks = n_peaks
+        self.phase_mode = phase_mode
+        self.mask_phases = mask_phases
+        self.n_feat = self.N_FEAT[phase_mode]
+        self.n_out = n_peaks * self.n_feat
+        # z-score parameters (set via set_normalization)
+        self.register_buffer("mean", torch.zeros(self.n_out))
+        self.register_buffer("std", torch.ones(self.n_out))
+
+    def compute_normalization(self, raw_tokens):
+        """Compute z-score stats from embedded training tokens."""
+        embedded = self._embed(raw_tokens)
+        flat = embedded.reshape(-1, embedded.shape[-1])
+        self.mean = flat.mean(dim=0)
+        self.std = flat.std(dim=0).clamp(min=1e-8)
+
+    def _embed(self, raw_tokens):
+        """Apply transforms to raw tokens (before z-scoring)."""
+        # raw_tokens: (B, W, K*5)  →  (B, W, K, 5)
+        B, W, _ = raw_tokens.shape
+        raw = raw_tokens.reshape(B, W, self.n_peaks, 5)
+
+        freq = raw[..., 0]
+        dlnf = raw[..., 1]
+        amp = torch.log1p(raw[..., 2])
+        ps = raw[..., 3]  # phase_start
+        pe = raw[..., 4]  # phase_end
+
+        if self.phase_mode == "center":
+            phi = (ps + pe) / 2
+            features = torch.stack([freq, dlnf, amp,
+                                    torch.cos(phi), torch.sin(phi)], dim=-1)
+        else:
+            features = torch.stack([freq, dlnf, amp,
+                                    torch.cos(ps), torch.sin(ps),
+                                    torch.cos(pe), torch.sin(pe)], dim=-1)
+
+        out = features.reshape(B, W, -1)  # (B, W, K*n_feat)
+
+        if self.mask_phases:
+            for p in range(self.n_peaks):
+                out[..., p * self.n_feat + 3 : p * self.n_feat + self.n_feat] = 0.0
+
+        return out
+
+    def forward(self, raw_tokens):
+        return (self._embed(raw_tokens) - self.mean) / self.std
+
+
+class EMRITransformer(nn.Module):
+    """Embedding -> positional encoding -> TransformerEncoder ->
     global average pool -> MLP head -> Sigmoid (output in [0, 1]).
     """
 
-    def __init__(self, n_features, seq_len, d_model, n_heads, n_layers,
+    def __init__(self, embedding, seq_len, d_model, n_heads, n_layers,
                  d_ff, dropout=0.1):
         super().__init__()
-        self.input_proj = nn.Linear(n_features, d_model)
+        self.embedding = embedding
+        self.input_proj = nn.Linear(embedding.n_out, d_model)
         self.pos_encoding = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -209,6 +230,7 @@ class EMRITransformer(nn.Module):
         )
 
     def forward(self, x):
+        x = self.embedding(x)
         x = self.input_proj(x) + self.pos_encoding
         x = self.encoder(x)
         x = x.mean(dim=1)
@@ -367,10 +389,14 @@ if __name__ == "__main__":
     print(f"  Done in {time.time() - t0:.1f}s")
     print(f"  Token shape: {train_tokens.shape}")
 
-    # 4. Normalize
-    tok_mean, tok_std = compute_normalization(train_tokens)
-    train_tokens = normalize_tokens(train_tokens, tok_mean, tok_std).cpu()
-    val_tokens = normalize_tokens(val_tokens, tok_mean, tok_std).cpu()
+    # 4. Build embedding and compute normalization from training tokens
+    embedding = TokenEmbedding(N_PEAKS, phase_mode=PHASE_MODE,
+                               mask_phases=MASK_PHASES).double().to(device)
+    embedding.compute_normalization(train_tokens)
+
+    # Move raw tokens to CPU for DataLoader
+    train_tokens = train_tokens.cpu()
+    val_tokens = val_tokens.cpu()
 
     # Min-max normalize f0 to [0, 1]
     train_targets = torch.from_numpy(
@@ -389,7 +415,7 @@ if __name__ == "__main__":
     # 6. Model
     seq_len = train_tokens.shape[1]
     model = EMRITransformer(
-        n_features=N_PEAKS * 9, seq_len=seq_len, d_model=D_MODEL,
+        embedding=embedding, seq_len=seq_len, d_model=D_MODEL,
         n_heads=N_HEADS, n_layers=N_LAYERS, d_ff=D_FF, dropout=DROPOUT,
     ).double().to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
