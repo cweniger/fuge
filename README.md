@@ -59,18 +59,18 @@ Phase boundaries overlap between adjacent windows: `phase_end[w] = phase_start[w
 - `n_peaks` — Peaks per time window (default 3)
 - `radius` — Peak suppression radius for local-max detection (default 2)
 - `n_dlnf`, `dlnf_min`, `dlnf_max` — De-chirp grid (default 11 points, 0.0 to 0.05)
-- `psd` — Pre-computed noise PSD, shape `(W, Fk)` where `Fk = k // 2 + 1` (default None = no whitening)
+- `noise_std` — Pre-computed noise std per bin, shape `(W, Fk)` where `Fk = k // 2 + 1` (default None = no whitening)
 
-**PSD whitening:** Divides the STFT by `sqrt(PSD)` before peak detection, so amplitudes become SNR-like. Two ways to set the PSD:
+**Whitening:** Divides the STFT by noise std before peak detection, so amplitudes become SNR-like. Two ways to set the noise std:
 
 ```python
-# Option 1: Pre-computed PSD
-tokenizer = SpectralTokenizer(k=1024, psd=my_psd)  # my_psd: (W, Fk)
+# Option 1: Pre-computed noise std
+tokenizer = SpectralTokenizer(k=1024, noise_std=my_std)  # my_std: (W, Fk)
 
 # Option 2: Streaming EMA from data
 tokenizer = SpectralTokenizer(k=1024)
-tokenizer.update_psd(noise_batch)          # first call sets PSD
-tokenizer.update_psd(noise_batch2, momentum=0.99)  # subsequent calls EMA-update
+tokenizer.update_noise_std(noise_batch)          # first call sets noise_std
+tokenizer.update_noise_std(noise_batch2, momentum=0.99)  # subsequent calls EMA-update
 ```
 
 ### `TokenEmbedding` — Feature transforms + normalization

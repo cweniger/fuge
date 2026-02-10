@@ -524,15 +524,15 @@ if __name__ == "__main__":
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double().to(device)
 
-    # Estimate PSD from pure noise batches
-    print("Estimating PSD from noise...")
+    # Estimate noise std from pure noise batches
+    print("Estimating noise std...")
     for _ in range(10):
         noise_batch = generate_colored_noise(64, N, T_OBS, colored_psd, rng)
-        tok_psd.update_psd(
+        tok_psd.update_noise_std(
             torch.from_numpy(noise_batch).to(device, dtype=torch.float64),
             momentum=0.9)
-    print(f"  PSD shape: {tok_psd.psd.shape}")
-    print(f"  PSD range: [{tok_psd.psd.min():.2e}, {tok_psd.psd.max():.2e}]")
+    print(f"  noise_std shape: {tok_psd.noise_std.shape}")
+    print(f"  noise_std range: [{tok_psd.noise_std.min():.2e}, {tok_psd.noise_std.max():.2e}]")
 
     # ── 5. Tokenize all three cases ──────────────────────────────────
     print("\nTokenizing: white noise (no whitening)...")
