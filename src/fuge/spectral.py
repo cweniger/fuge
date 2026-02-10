@@ -372,7 +372,7 @@ class SpectralTokenizer(nn.Module):
 
     Output
     ------
-    forward(x) returns raw tokens of shape (B, N_WINDOWS, n_peaks * 5)
+    forward(x) returns raw tokens of shape (B, N_WINDOWS, n_peaks, 5)
     with 5 values per peak: [freq, dlnf, amp, phase_start, phase_end].
     """
 
@@ -390,9 +390,9 @@ class SpectralTokenizer(nn.Module):
         return self.decomposer.k
 
     @property
-    def n_features(self):
-        """Number of raw features per time window (n_peaks * 5)."""
-        return self.n_peaks * 5
+    def n_raw(self):
+        """Number of raw features per peak token (always 5)."""
+        return 5
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -404,8 +404,9 @@ class SpectralTokenizer(nn.Module):
 
         Returns
         -------
-        tokens : Tensor, shape (B, N_WINDOWS, n_peaks * 5) or (N_WINDOWS, n_peaks * 5)
-            Raw values: [freq, dlnf, amp, phase_start, phase_end] per peak.
+        tokens : Tensor, shape (B, W, K, 5) or (W, K, 5)
+            Raw values per peak: [freq, dlnf, amp, phase_start, phase_end].
+            W = number of time windows, K = n_peaks.
         """
         squeeze = x.dim() == 1
         if squeeze:
@@ -418,9 +419,7 @@ class SpectralTokenizer(nn.Module):
         ps, pe = self.decomposer.peak_phases(
             X, peaks, freq, dlnf, self.dlnf_grid)
 
-        # Stack features: (B, W, K, 5) -> (B, W, K*5)
-        tokens = torch.stack([freq, dlnf, amp, ps, pe], dim=-1)
-        tokens = tokens.reshape(tokens.shape[0], tokens.shape[1], -1)
+        tokens = torch.stack([freq, dlnf, amp, ps, pe], dim=-1)  # (B, W, K, 5)
 
         if squeeze:
             tokens = tokens.squeeze(0)

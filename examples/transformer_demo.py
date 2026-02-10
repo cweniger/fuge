@@ -57,7 +57,7 @@ MASK_PHASES = False          # zero out phase features (for ablation)
 # ── Training ────────────────────────────────────────────────────────
 BATCH_SIZE = 64
 LR = 1e-3
-N_EPOCHS = 200
+N_EPOCHS = 60
 
 
 # =====================================================================
@@ -126,79 +126,88 @@ class EMRITokenDataset(Dataset):
 # =====================================================================
 
 class TokenEmbedding(nn.Module):
-    """Embed raw token values into model-ready features.
+    """Embed raw peak tokens into model-ready features.
 
-    Raw tokens: 5 values per peak [freq, dlnf, amp, phase_start, phase_end].
-    Applies cos/sin to phases, log1p to amplitude, then z-score normalizes.
+    Input: (B, W, K, 5) raw values [freq, dlnf, amp, phase_start, phase_end].
+    Output: (B, W*K, n_embed) z-score normalized embedded features.
 
-    PHASE_MODE == "center":   uses (phase_start + phase_end) / 2 → 5 embedded features/peak
-    PHASE_MODE == "boundary": uses phase_start and phase_end   → 7 embedded features/peak
+    Each peak becomes an independent token in the sequence.  Applies
+    cos/sin to phases, log1p to amplitude, then z-score normalizes.
+
+    PHASE_MODE == "center":   (phase_start + phase_end) / 2  → n_embed = 5
+    PHASE_MODE == "boundary": keep both endpoints            → n_embed = 7
     """
 
-    N_FEAT = {"center": 5, "boundary": 7}
+    N_EMBED = {"center": 5, "boundary": 7}
 
-    def __init__(self, n_peaks, phase_mode="center", mask_phases=False):
+    def __init__(self, phase_mode="center", mask_phases=False):
         super().__init__()
-        self.n_peaks = n_peaks
         self.phase_mode = phase_mode
         self.mask_phases = mask_phases
-        self.n_feat = self.N_FEAT[phase_mode]
-        self.n_out = n_peaks * self.n_feat
-        # z-score parameters (set via set_normalization)
-        self.register_buffer("mean", torch.zeros(self.n_out))
-        self.register_buffer("std", torch.ones(self.n_out))
+        self.n_embed = self.N_EMBED[phase_mode]
+        self.register_buffer("mean", torch.zeros(self.n_embed))
+        self.register_buffer("std", torch.ones(self.n_embed))
 
     def compute_normalization(self, raw_tokens):
-        """Compute z-score stats from embedded training tokens."""
-        embedded = self._embed(raw_tokens)
-        flat = embedded.reshape(-1, embedded.shape[-1])
+        """Compute z-score stats from training tokens.
+
+        raw_tokens: (B, W, K, 5)
+        """
+        embedded = self._embed(raw_tokens)          # (B, W, K, n_embed)
+        flat = embedded.reshape(-1, self.n_embed)
         self.mean = flat.mean(dim=0)
         self.std = flat.std(dim=0).clamp(min=1e-8)
 
     def _embed(self, raw_tokens):
-        """Apply transforms to raw tokens (before z-scoring)."""
-        # raw_tokens: (B, W, K*5)  →  (B, W, K, 5)
-        B, W, _ = raw_tokens.shape
-        raw = raw_tokens.reshape(B, W, self.n_peaks, 5)
+        """Transform raw features (before z-scoring).
 
-        freq = raw[..., 0]
-        dlnf = raw[..., 1]
-        amp = torch.log1p(raw[..., 2])
-        ps = raw[..., 3]  # phase_start
-        pe = raw[..., 4]  # phase_end
+        raw_tokens: (B, W, K, 5) -> (B, W, K, n_embed)
+        """
+        freq = raw_tokens[..., 0]
+        dlnf = raw_tokens[..., 1]
+        amp = torch.log1p(raw_tokens[..., 2])
+        ps = raw_tokens[..., 3]
+        pe = raw_tokens[..., 4]
 
         if self.phase_mode == "center":
             phi = (ps + pe) / 2
-            features = torch.stack([freq, dlnf, amp,
-                                    torch.cos(phi), torch.sin(phi)], dim=-1)
+            out = torch.stack([freq, dlnf, amp,
+                               torch.cos(phi), torch.sin(phi)], dim=-1)
         else:
-            features = torch.stack([freq, dlnf, amp,
-                                    torch.cos(ps), torch.sin(ps),
-                                    torch.cos(pe), torch.sin(pe)], dim=-1)
-
-        out = features.reshape(B, W, -1)  # (B, W, K*n_feat)
+            out = torch.stack([freq, dlnf, amp,
+                               torch.cos(ps), torch.sin(ps),
+                               torch.cos(pe), torch.sin(pe)], dim=-1)
 
         if self.mask_phases:
-            for p in range(self.n_peaks):
-                out[..., p * self.n_feat + 3 : p * self.n_feat + self.n_feat] = 0.0
+            out[..., 3:] = 0.0
 
         return out
 
     def forward(self, raw_tokens):
-        return (self._embed(raw_tokens) - self.mean) / self.std
+        """Embed and normalize: (B, W, K, 5) -> (B, W*K, n_embed)."""
+        B, W, K, _ = raw_tokens.shape
+        embedded = self._embed(raw_tokens)                   # (B, W, K, n_embed)
+        normalized = (embedded - self.mean) / self.std
+        return normalized.reshape(B, W * K, self.n_embed), W, K
 
 
 class EMRITransformer(nn.Module):
-    """Embedding -> positional encoding -> TransformerEncoder ->
-    global average pool -> MLP head -> Sigmoid (output in [0, 1]).
+    """Embedding -> time-only positional encoding -> TransformerEncoder ->
+    global average pool -> MLP head -> Sigmoid.
+
+    Each peak is an independent token.  Positional encoding is shared
+    across all K peaks within the same time window.
     """
 
-    def __init__(self, embedding, seq_len, n_out, d_model, n_heads, n_layers,
-                 d_ff, dropout=0.1):
+    def __init__(self, embedding, n_windows, n_peaks, n_out, d_model,
+                 n_heads, n_layers, d_ff, dropout=0.1):
         super().__init__()
         self.embedding = embedding
-        self.input_proj = nn.Linear(embedding.n_out, d_model)
-        self.pos_encoding = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
+        self.n_peaks = n_peaks
+        self.input_proj = nn.Linear(embedding.n_embed, d_model)
+        # Time-only positional encoding: (1, W, 1, d_model), broadcast over K
+        self.pos_encoding = nn.Parameter(
+            torch.randn(1, n_windows, 1, d_model) * 0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
@@ -216,9 +225,15 @@ class EMRITransformer(nn.Module):
         )
 
     def forward(self, x):
-        x = self.embedding(x)
-        x = self.input_proj(x) + self.pos_encoding
-        x = self.encoder(x)
+        """x: (B, W, K, 5) raw tokens."""
+        B, W, K, _ = x.shape
+        embedded, _, _ = self.embedding(x)        # (B, W*K, n_embed)
+        projected = self.input_proj(embedded)      # (B, W*K, d_model)
+        # Reshape to (B, W, K, d_model), add time pos encoding, flatten back
+        projected = projected.reshape(B, W, K, -1)
+        projected = projected + self.pos_encoding  # broadcasts over K
+        projected = projected.reshape(B, W * K, -1)
+        x = self.encoder(projected)
         x = x.mean(dim=1)
         return self.head(x)
 
@@ -366,7 +381,7 @@ if __name__ == "__main__":
     print(f"  Token shape: {train_tokens.shape}")
 
     # 4. Build embedding and compute normalization from training tokens
-    embedding = TokenEmbedding(N_PEAKS, phase_mode=PHASE_MODE,
+    embedding = TokenEmbedding(phase_mode=PHASE_MODE,
                                mask_phases=MASK_PHASES).double().to(device)
     embedding.compute_normalization(train_tokens)
 
@@ -389,9 +404,10 @@ if __name__ == "__main__":
         batch_size=BATCH_SIZE)
 
     # 6. Model
-    seq_len = train_tokens.shape[1]
+    n_windows = train_tokens.shape[1]
     model = EMRITransformer(
-        embedding=embedding, seq_len=seq_len, n_out=N_PARAMS, d_model=D_MODEL,
+        embedding=embedding, n_windows=n_windows, n_peaks=N_PEAKS,
+        n_out=N_PARAMS, d_model=D_MODEL,
         n_heads=N_HEADS, n_layers=N_LAYERS, d_ff=D_FF, dropout=DROPOUT,
     ).double().to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
