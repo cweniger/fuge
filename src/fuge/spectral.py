@@ -175,10 +175,12 @@ class SpectralDecomposer(nn.Module):
         Both frequency and dlnf positions are refined via parabolic
         interpolation on the amplitude and its immediate neighbours.
 
+        Supports both single and batched input.
+
         Parameters
         ----------
-        X : complex Tensor, shape (D, N_WINDOWS, k)
-            Batched STFT output from forward() with a 1-D dlnf tensor.
+        X : complex Tensor, shape (D, N_WINDOWS, k) or (D, B, N_WINDOWS, k)
+            STFT output from forward() with a 1-D dlnf tensor.
         K : int
             Number of peaks to return per time window.
         dlnf_grid : Tensor, shape (D,)
@@ -189,38 +191,46 @@ class SpectralDecomposer(nn.Module):
 
         Returns
         -------
-        peaks : LongTensor, shape (N_WINDOWS, K, 2)
+        peaks : LongTensor, shape ([B,] N_WINDOWS, K, 2)
             Integer (dlnf_idx, freq_idx) of each peak.
-        freq_refined : Tensor, shape (N_WINDOWS, K)
+        freq_refined : Tensor, shape ([B,] N_WINDOWS, K)
             Parabolic-interpolated fractional frequency bin index.
-        dlnf_refined : Tensor, shape (N_WINDOWS, K)
+        dlnf_refined : Tensor, shape ([B,] N_WINDOWS, K)
             Parabolic-interpolated dlnf value.
-        values : Tensor, shape (N_WINDOWS, K)
+        values : Tensor, shape ([B,] N_WINDOWS, K)
             Amplitude at integer peak location.
         """
-        # Positive frequencies only
-        amp = X[:, :, :self.k // 2 + 1].abs()  # (D, N_WINDOWS, F)
-        amp = amp.permute(1, 0, 2)              # (N_WINDOWS, D, F)
-        W, D, Fk = amp.shape
+        batched = X.dim() == 4
+        if not batched:
+            X = X.unsqueeze(1)  # (D, 1, W, k)
+
+        D, B, W, k_full = X.shape
+        Fk = self.k // 2 + 1
+
+        # Merge batch and window dims: all ops are per-window
+        amp = X[..., :Fk].abs()           # (D, B, W, F)
+        amp = amp.permute(1, 2, 0, 3)     # (B, W, D, F)
+        amp = amp.reshape(B * W, D, Fk)   # (BW, D, F)
+        BW = B * W
 
         # Max pool to find local maxima
         kernel = 2 * radius + 1
-        amp_4d = amp.unsqueeze(1)               # (W, 1, D, F)
+        amp_4d = amp.unsqueeze(1)          # (BW, 1, D, F)
         pooled = F.max_pool2d(amp_4d, kernel_size=kernel, stride=1, padding=radius)
-        is_peak = (amp_4d == pooled).squeeze(1)  # (W, D, F)
+        is_peak = (amp_4d == pooled).squeeze(1)  # (BW, D, F)
 
         # Keep only peak amplitudes, flatten spatial dims
         amp_peaks = torch.where(is_peak, amp, torch.zeros_like(amp))
-        amp_flat = amp_peaks.reshape(W, -1)      # (W, D*F)
+        amp_flat = amp_peaks.reshape(BW, -1)  # (BW, D*F)
 
-        topk_vals, topk_idx = amp_flat.topk(K, dim=1)  # (W, K)
+        topk_vals, topk_idx = amp_flat.topk(K, dim=1)  # (BW, K)
 
         # Unravel flat index -> (dlnf_idx, freq_idx)
         dlnf_idx = topk_idx // Fk
         freq_idx = topk_idx % Fk
-        peaks = torch.stack([dlnf_idx, freq_idx], dim=-1)  # (W, K, 2)
+        peaks = torch.stack([dlnf_idx, freq_idx], dim=-1)  # (BW, K, 2)
 
-        amp_2d = amp.reshape(W, -1)  # (W, D*Fk)
+        amp_2d = amp.reshape(BW, -1)  # (BW, D*Fk)
 
         # --- Parabolic interpolation along frequency axis ---
         fi = freq_idx.clamp(1, Fk - 2)
@@ -254,6 +264,18 @@ class SpectralDecomposer(nn.Module):
         dlnf_step = dlnf_grid[1] - dlnf_grid[0] if D > 1 else torch.ones(1, device=X.device)
         dlnf_refined = dlnf_grid[di] + d_delta * dlnf_step
 
+        # Restore (B, W, ...) shape
+        peaks = peaks.reshape(B, W, K, 2)
+        freq_refined = freq_refined.reshape(B, W, K)
+        dlnf_refined = dlnf_refined.reshape(B, W, K)
+        topk_vals = topk_vals.reshape(B, W, K)
+
+        if not batched:
+            peaks = peaks.squeeze(0)
+            freq_refined = freq_refined.squeeze(0)
+            dlnf_refined = dlnf_refined.squeeze(0)
+            topk_vals = topk_vals.squeeze(0)
+
         return peaks, freq_refined, dlnf_refined, topk_vals
 
     def peak_phases(self, X: torch.Tensor, peaks: torch.Tensor,
@@ -270,43 +292,136 @@ class SpectralDecomposer(nn.Module):
         phase_center (at the window midpoint) can be recovered as
         (phase_start + phase_end) / 2.
 
+        Supports both single and batched input.
+
         Parameters
         ----------
-        X : complex Tensor, shape (D, N_WINDOWS, k)
-        peaks : LongTensor, shape (N_WINDOWS, K, 2)
+        X : complex Tensor, shape (D, N_WINDOWS, k) or (D, B, N_WINDOWS, k)
+        peaks : LongTensor, shape ([B,] N_WINDOWS, K, 2)
             Integer (dlnf_idx, freq_idx) from find_peaks.
-        freq_refined : Tensor, shape (N_WINDOWS, K)
+        freq_refined : Tensor, shape ([B,] N_WINDOWS, K)
             Fractional frequency bin index (in de-chirped domain).
-        dlnf_refined : Tensor, shape (N_WINDOWS, K)
+        dlnf_refined : Tensor, shape ([B,] N_WINDOWS, K)
             Interpolated dlnf value (true chirp rate).
         dlnf_grid : Tensor, shape (D,)
             The dlnf grid used for de-chirping.
 
         Returns
         -------
-        phase_start : Tensor, shape (N_WINDOWS, K)
+        phase_start : Tensor, shape ([B,] N_WINDOWS, K)
             Phase at sample k/4 (t = -0.5 in Hann window coords).
-        phase_end : Tensor, shape (N_WINDOWS, K)
+        phase_end : Tensor, shape ([B,] N_WINDOWS, K)
             Phase at sample 3k/4 (t = +0.5 in Hann window coords).
             phase_end[w] = phase_start[w+1] for noiseless signals.
         """
-        dlnf_idx = peaks[:, :, 0]
-        freq_idx = peaks[:, :, 1]
+        batched = X.dim() == 4
+        if not batched:
+            X = X.unsqueeze(1)      # (D, 1, W, k)
+            peaks = peaks.unsqueeze(0)
+            freq_refined = freq_refined.unsqueeze(0)
 
-        # Gather complex STFT at integer peak bins
-        Xp = X.permute(1, 0, 2).reshape(X.shape[1], -1)   # (W, D*k)
-        flat_idx = dlnf_idx * X.shape[2] + freq_idx        # (W, K)
-        X_peak = Xp.gather(1, flat_idx)                     # (W, K) complex
+        D, B, W, k_full = X.shape
+        K = peaks.shape[2]
+
+        # Flatten batch*window for per-window gather
+        dlnf_idx = peaks.reshape(B * W, K, 2)[:, :, 0]   # (BW, K)
+        freq_idx = peaks.reshape(B * W, K, 2)[:, :, 1]    # (BW, K)
+        freq_ref = freq_refined.reshape(B * W, K)          # (BW, K)
+
+        # Rearrange X: (D, B, W, k) -> (B, W, D, k) -> (BW, D*k)
+        Xp = X.permute(1, 2, 0, 3).reshape(B * W, D * k_full)
+        flat_idx = dlnf_idx * k_full + freq_idx
+        X_peak = Xp.gather(1, flat_idx)  # (BW, K) complex
 
         # Phase at window start (sample 0), corrected for fractional bin offset.
-        f_delta = freq_refined - freq_idx.float()
+        f_delta = freq_ref - freq_idx.float()
         phi_0 = X_peak.angle() - torch.pi * f_delta * (self.k - 1) / self.k
 
         # Advance to half-window boundaries using freq_refined (bin units).
         # phase(n) = phi_0 + 2*pi * freq * n / k
         # phase_start at n = k/4:  phi_0 + pi * freq / 2
         # phase_end   at n = 3k/4: phi_0 + 3 * pi * freq / 2
-        phase_start = phi_0 + torch.pi * freq_refined / 2
-        phase_end = phi_0 + 3 * torch.pi * freq_refined / 2
+        phase_start = (phi_0 + torch.pi * freq_ref / 2).reshape(B, W, K)
+        phase_end = (phi_0 + 3 * torch.pi * freq_ref / 2).reshape(B, W, K)
+
+        if not batched:
+            phase_start = phase_start.squeeze(0)
+            phase_end = phase_end.squeeze(0)
 
         return phase_start, phase_end
+
+
+class SpectralTokenizer(nn.Module):
+    """Tokenize time-domain signals into spectral peak features.
+
+    Wraps SpectralDecomposer and chains STFT -> peak finding -> phase
+    extraction into a single batched forward pass.
+
+    Parameters
+    ----------
+    k : int
+        Window size (FFT size) in samples.
+    n_peaks : int
+        Number of peaks to extract per time window.
+    radius : int
+        Peak suppression radius for max-pool peak detection.
+    n_dlnf : int
+        Number of dlnf (relative chirp rate) grid points.
+    dlnf_min, dlnf_max : float
+        Range of dlnf grid.
+
+    Output
+    ------
+    forward(x) returns raw tokens of shape (B, N_WINDOWS, n_peaks * 5)
+    with 5 values per peak: [freq, dlnf, amp, phase_start, phase_end].
+    """
+
+    def __init__(self, k: int = 1024, n_peaks: int = 3, radius: int = 2,
+                 n_dlnf: int = 11, dlnf_min: float = 0.0, dlnf_max: float = 0.05):
+        super().__init__()
+        self.decomposer = SpectralDecomposer(k=k)
+        self.n_peaks = n_peaks
+        self.radius = radius
+        self.register_buffer(
+            "dlnf_grid", torch.linspace(dlnf_min, dlnf_max, n_dlnf))
+
+    @property
+    def k(self):
+        return self.decomposer.k
+
+    @property
+    def n_features(self):
+        """Number of raw features per time window (n_peaks * 5)."""
+        return self.n_peaks * 5
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Tokenize batched time-domain signals.
+
+        Parameters
+        ----------
+        x : Tensor, shape (B, N) or (N,)
+
+        Returns
+        -------
+        tokens : Tensor, shape (B, N_WINDOWS, n_peaks * 5) or (N_WINDOWS, n_peaks * 5)
+            Raw values: [freq, dlnf, amp, phase_start, phase_end] per peak.
+        """
+        squeeze = x.dim() == 1
+        if squeeze:
+            x = x.unsqueeze(0)
+
+        X = self.decomposer(x, dlnf=self.dlnf_grid)  # (D, B, W, k)
+
+        peaks, freq, dlnf, amp = self.decomposer.find_peaks(
+            X, K=self.n_peaks, dlnf_grid=self.dlnf_grid, radius=self.radius)
+        ps, pe = self.decomposer.peak_phases(
+            X, peaks, freq, dlnf, self.dlnf_grid)
+
+        # Stack features: (B, W, K, 5) -> (B, W, K*5)
+        tokens = torch.stack([freq, dlnf, amp, ps, pe], dim=-1)
+        tokens = tokens.reshape(tokens.shape[0], tokens.shape[1], -1)
+
+        if squeeze:
+            tokens = tokens.squeeze(0)
+        return tokens

@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-from fuge import SpectralDecomposer, emri_signal
+from fuge import SpectralTokenizer, emri_signal
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000
@@ -90,39 +90,19 @@ def generate_dataset(n_signals, rng):
 # Tokenization
 # =====================================================================
 
-def tokenize_signals(signals, device):
-    """Convert raw signals to raw token values.
+TOKENIZE_BATCH = 64  # signals per GPU batch during tokenization
 
-    Returns 5 raw values per peak: [freq, dlnf, amp, phase_start, phase_end].
-    No cos/sin or log transforms — those belong in the embedding layer.
-    """
-    decomposer = SpectralDecomposer(k=K_WINDOW).double().to(device)
-    dlnf_grid = torch.linspace(DLNF_MIN, DLNF_MAX, N_DLNF, device=device, dtype=torch.float64)
-
+def tokenize_signals(signals, tokenizer, device):
+    """Tokenize signals in batches using SpectralTokenizer."""
     all_tokens = []
-
-    for i in range(len(signals)):
-        x = torch.from_numpy(signals[i]).double().to(device)
-
-        X = decomposer(x, dlnf=dlnf_grid)  # (D, N_WINDOWS, k)
-
-        peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
-            X, K=N_PEAKS, dlnf_grid=dlnf_grid)
-
-        phase_start, phase_end = decomposer.peak_phases(
-            X, peaks, freq_refined, dlnf_refined, dlnf_grid)
-
-        features = torch.stack([
-            freq_refined, dlnf_refined, peak_vals, phase_start, phase_end,
-        ], dim=-1)  # (N_WINDOWS, K, 5)
-
-        features = features.reshape(features.shape[0], -1)  # (N_WINDOWS, K*5)
-        all_tokens.append(features)
-
-        if (i + 1) % 100 == 0:
-            print(f"  {i + 1}/{len(signals)}")
-
-    return torch.stack(all_tokens)
+    for start in range(0, len(signals), TOKENIZE_BATCH):
+        batch = torch.from_numpy(signals[start:start + TOKENIZE_BATCH]).to(
+            device=device, dtype=tokenizer.dlnf_grid.dtype)
+        all_tokens.append(tokenizer(batch).cpu())
+        done = min(start + TOKENIZE_BATCH, len(signals))
+        if done % 500 == 0 or done == len(signals):
+            print(f"  {done}/{len(signals)}")
+    return torch.cat(all_tokens)
 
 
 # =====================================================================
@@ -375,9 +355,13 @@ if __name__ == "__main__":
 
     # 3. Tokenize
     print("Tokenizing signals...")
+    tokenizer = SpectralTokenizer(
+        k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
+        dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
+    ).double().to(device)
     t0 = time.time()
-    train_tokens = tokenize_signals(train_signals, device)
-    val_tokens = tokenize_signals(val_signals, device)
+    train_tokens = tokenize_signals(train_signals, tokenizer, device)
+    val_tokens = tokenize_signals(val_signals, tokenizer, device)
     print(f"  Done in {time.time() - t0:.1f}s")
     print(f"  Token shape: {train_tokens.shape}")
 
