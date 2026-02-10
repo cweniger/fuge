@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-from fuge import SpectralDecomposer, emri_signal
+from fuge import SpectralTokenizer, TokenEmbedding, TransformerEmbedding, emri_signal
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000
@@ -57,7 +57,7 @@ MASK_PHASES = False          # zero out phase features (for ablation)
 # ── Training ────────────────────────────────────────────────────────
 BATCH_SIZE = 64
 LR = 1e-3
-N_EPOCHS = 200
+N_EPOCHS = 60
 
 
 # =====================================================================
@@ -90,39 +90,19 @@ def generate_dataset(n_signals, rng):
 # Tokenization
 # =====================================================================
 
-def tokenize_signals(signals, device):
-    """Convert raw signals to raw token values.
+TOKENIZE_BATCH = 64  # signals per GPU batch during tokenization
 
-    Returns 5 raw values per peak: [freq, dlnf, amp, phase_start, phase_end].
-    No cos/sin or log transforms — those belong in the embedding layer.
-    """
-    decomposer = SpectralDecomposer(k=K_WINDOW).double().to(device)
-    dlnf_grid = torch.linspace(DLNF_MIN, DLNF_MAX, N_DLNF, device=device, dtype=torch.float64)
-
+def tokenize_signals(signals, tokenizer, device):
+    """Tokenize signals in batches using SpectralTokenizer."""
     all_tokens = []
-
-    for i in range(len(signals)):
-        x = torch.from_numpy(signals[i]).double().to(device)
-
-        X = decomposer(x, dlnf=dlnf_grid)  # (D, N_WINDOWS, k)
-
-        peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
-            X, K=N_PEAKS, dlnf_grid=dlnf_grid)
-
-        phase_start, phase_end = decomposer.peak_phases(
-            X, peaks, freq_refined, dlnf_refined, dlnf_grid)
-
-        features = torch.stack([
-            freq_refined, dlnf_refined, peak_vals, phase_start, phase_end,
-        ], dim=-1)  # (N_WINDOWS, K, 5)
-
-        features = features.reshape(features.shape[0], -1)  # (N_WINDOWS, K*5)
-        all_tokens.append(features)
-
-        if (i + 1) % 100 == 0:
-            print(f"  {i + 1}/{len(signals)}")
-
-    return torch.stack(all_tokens)
+    for start in range(0, len(signals), TOKENIZE_BATCH):
+        batch = torch.from_numpy(signals[start:start + TOKENIZE_BATCH]).to(
+            device=device, dtype=tokenizer.dlnf_grid.dtype)
+        all_tokens.append(tokenizer(batch).cpu())
+        done = min(start + TOKENIZE_BATCH, len(signals))
+        if done % 500 == 0 or done == len(signals):
+            print(f"  {done}/{len(signals)}")
+    return torch.cat(all_tokens)
 
 
 # =====================================================================
@@ -142,105 +122,26 @@ class EMRITokenDataset(Dataset):
 
 
 # =====================================================================
-# Embedding + Transformer model
+# Model: TransformerEmbedding backbone + task-specific head
 # =====================================================================
 
-class TokenEmbedding(nn.Module):
-    """Embed raw token values into model-ready features.
+class EMRIModel(nn.Module):
+    """TransformerEmbedding backbone + regression head for demo."""
 
-    Raw tokens: 5 values per peak [freq, dlnf, amp, phase_start, phase_end].
-    Applies cos/sin to phases, log1p to amplitude, then z-score normalizes.
-
-    PHASE_MODE == "center":   uses (phase_start + phase_end) / 2 → 5 embedded features/peak
-    PHASE_MODE == "boundary": uses phase_start and phase_end   → 7 embedded features/peak
-    """
-
-    N_FEAT = {"center": 5, "boundary": 7}
-
-    def __init__(self, n_peaks, phase_mode="center", mask_phases=False):
+    def __init__(self, backbone, n_out, dropout=0.1):
         super().__init__()
-        self.n_peaks = n_peaks
-        self.phase_mode = phase_mode
-        self.mask_phases = mask_phases
-        self.n_feat = self.N_FEAT[phase_mode]
-        self.n_out = n_peaks * self.n_feat
-        # z-score parameters (set via set_normalization)
-        self.register_buffer("mean", torch.zeros(self.n_out))
-        self.register_buffer("std", torch.ones(self.n_out))
-
-    def compute_normalization(self, raw_tokens):
-        """Compute z-score stats from embedded training tokens."""
-        embedded = self._embed(raw_tokens)
-        flat = embedded.reshape(-1, embedded.shape[-1])
-        self.mean = flat.mean(dim=0)
-        self.std = flat.std(dim=0).clamp(min=1e-8)
-
-    def _embed(self, raw_tokens):
-        """Apply transforms to raw tokens (before z-scoring)."""
-        # raw_tokens: (B, W, K*5)  →  (B, W, K, 5)
-        B, W, _ = raw_tokens.shape
-        raw = raw_tokens.reshape(B, W, self.n_peaks, 5)
-
-        freq = raw[..., 0]
-        dlnf = raw[..., 1]
-        amp = torch.log1p(raw[..., 2])
-        ps = raw[..., 3]  # phase_start
-        pe = raw[..., 4]  # phase_end
-
-        if self.phase_mode == "center":
-            phi = (ps + pe) / 2
-            features = torch.stack([freq, dlnf, amp,
-                                    torch.cos(phi), torch.sin(phi)], dim=-1)
-        else:
-            features = torch.stack([freq, dlnf, amp,
-                                    torch.cos(ps), torch.sin(ps),
-                                    torch.cos(pe), torch.sin(pe)], dim=-1)
-
-        out = features.reshape(B, W, -1)  # (B, W, K*n_feat)
-
-        if self.mask_phases:
-            for p in range(self.n_peaks):
-                out[..., p * self.n_feat + 3 : p * self.n_feat + self.n_feat] = 0.0
-
-        return out
-
-    def forward(self, raw_tokens):
-        return (self._embed(raw_tokens) - self.mean) / self.std
-
-
-class EMRITransformer(nn.Module):
-    """Embedding -> positional encoding -> TransformerEncoder ->
-    global average pool -> MLP head -> Sigmoid (output in [0, 1]).
-    """
-
-    def __init__(self, embedding, seq_len, n_out, d_model, n_heads, n_layers,
-                 d_ff, dropout=0.1):
-        super().__init__()
-        self.embedding = embedding
-        self.input_proj = nn.Linear(embedding.n_out, d_model)
-        self.pos_encoding = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
-            dropout=dropout, batch_first=True, activation="gelu",
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
+        self.backbone = backbone
         self.head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
+            nn.LayerNorm(backbone.d_model),
+            nn.Linear(backbone.d_model, backbone.d_model),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, n_out),
+            nn.Linear(backbone.d_model, n_out),
             nn.Sigmoid(),
         )
 
     def forward(self, x):
-        x = self.embedding(x)
-        x = self.input_proj(x) + self.pos_encoding
-        x = self.encoder(x)
-        x = x.mean(dim=1)
-        return self.head(x)
+        return self.head(self.backbone(x))
 
 
 # =====================================================================
@@ -375,16 +276,20 @@ if __name__ == "__main__":
 
     # 3. Tokenize
     print("Tokenizing signals...")
+    tokenizer = SpectralTokenizer(
+        k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
+        dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
+    ).double().to(device)
     t0 = time.time()
-    train_tokens = tokenize_signals(train_signals, device)
-    val_tokens = tokenize_signals(val_signals, device)
+    train_tokens = tokenize_signals(train_signals, tokenizer, device)
+    val_tokens = tokenize_signals(val_signals, tokenizer, device)
     print(f"  Done in {time.time() - t0:.1f}s")
     print(f"  Token shape: {train_tokens.shape}")
 
-    # 4. Build embedding and compute normalization from training tokens
-    embedding = TokenEmbedding(N_PEAKS, phase_mode=PHASE_MODE,
+    # 4. Build token embedding and compute normalization
+    token_emb = TokenEmbedding(phase_mode=PHASE_MODE,
                                mask_phases=MASK_PHASES).double().to(device)
-    embedding.compute_normalization(train_tokens)
+    token_emb.compute_normalization(train_tokens)
 
     # Move raw tokens to CPU for DataLoader
     train_tokens = train_tokens.cpu()
@@ -404,12 +309,15 @@ if __name__ == "__main__":
         EMRITokenDataset(val_tokens, val_targets),
         batch_size=BATCH_SIZE)
 
-    # 6. Model
-    seq_len = train_tokens.shape[1]
-    model = EMRITransformer(
-        embedding=embedding, seq_len=seq_len, n_out=N_PARAMS, d_model=D_MODEL,
-        n_heads=N_HEADS, n_layers=N_LAYERS, d_ff=D_FF, dropout=DROPOUT,
+    # 6. Model: backbone + head
+    n_windows = train_tokens.shape[1]
+    backbone = TransformerEmbedding(
+        token_embedding=token_emb, n_windows=n_windows, n_peaks=N_PEAKS,
+        d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS,
+        d_ff=D_FF, dropout=DROPOUT,
     ).double().to(device)
+    model = EMRIModel(backbone, n_out=N_PARAMS, dropout=DROPOUT
+                      ).double().to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # 7. Train
