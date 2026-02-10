@@ -355,7 +355,8 @@ class SpectralTokenizer(nn.Module):
     """Tokenize time-domain signals into spectral peak features.
 
     Wraps SpectralDecomposer and chains STFT -> peak finding -> phase
-    extraction into a single batched forward pass.
+    extraction into a single batched forward pass.  Optionally whitens
+    the STFT by a noise PSD before peak detection.
 
     Parameters
     ----------
@@ -369,21 +370,28 @@ class SpectralTokenizer(nn.Module):
         Number of dlnf (relative chirp rate) grid points.
     dlnf_min, dlnf_max : float
         Range of dlnf grid.
+    psd : Tensor or None
+        Pre-computed noise PSD, shape (W, Fk) where Fk = k // 2 + 1.
+        If None, no whitening is applied (can be set later via update_psd).
 
     Output
     ------
     forward(x) returns raw tokens of shape (B, N_WINDOWS, n_peaks, 5)
     with 5 values per peak: [freq, dlnf, amp, phase_start, phase_end].
+    When whitening is active, amp reflects SNR (amplitude / sqrt(PSD)).
     """
 
     def __init__(self, k: int = 1024, n_peaks: int = 3, radius: int = 2,
-                 n_dlnf: int = 11, dlnf_min: float = 0.0, dlnf_max: float = 0.05):
+                 n_dlnf: int = 11, dlnf_min: float = 0.0, dlnf_max: float = 0.05,
+                 psd: torch.Tensor = None):
         super().__init__()
         self.decomposer = SpectralDecomposer(k=k)
         self.n_peaks = n_peaks
         self.radius = radius
         self.register_buffer(
             "dlnf_grid", torch.linspace(dlnf_min, dlnf_max, n_dlnf))
+        # Noise PSD for whitening: (W, Fk). None = no whitening.
+        self.register_buffer("psd", psd)
 
     @property
     def k(self):
@@ -393,6 +401,56 @@ class SpectralTokenizer(nn.Module):
     def n_raw(self):
         """Number of raw features per peak token (always 5)."""
         return 5
+
+    @torch.no_grad()
+    def update_psd(self, x: torch.Tensor, momentum: float = 0.99) -> None:
+        """Update internal PSD estimate from a batch of signals.
+
+        Computes a non-de-chirped STFT and estimates the power spectral
+        density as ``mean(|X|^2)`` over the batch dimension.  On the first
+        call (when ``self.psd is None``), the PSD is set directly.  On
+        subsequent calls it is updated via exponential moving average::
+
+            psd = momentum * psd + (1 - momentum) * psd_new
+
+        Parameters
+        ----------
+        x : Tensor, shape (B, N) or (N,)
+            Time-domain signals (typically noise-dominated).
+        momentum : float
+            EMA smoothing factor (default 0.99).  Higher values give a
+            slower, more stable estimate.
+        """
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+
+        # Non-de-chirped STFT — noise PSD is chirp-independent
+        X = self.decomposer(x)                          # (B, W, k)
+        Fk = self.decomposer.k // 2 + 1
+        psd_new = (X[..., :Fk].abs() ** 2).mean(dim=0)  # (W, Fk)
+
+        if self.psd is None:
+            self.psd = psd_new
+        else:
+            self.psd = momentum * self.psd + (1 - momentum) * psd_new
+
+    def _whiten(self, X: torch.Tensor) -> torch.Tensor:
+        """Divide STFT positive-frequency bins by sqrt(PSD).
+
+        Parameters
+        ----------
+        X : complex Tensor, shape (D, B, W, k) or (B, W, k)
+
+        Returns
+        -------
+        X_w : complex Tensor, same shape as X.
+        """
+        Fk = self.decomposer.k // 2 + 1
+        # psd: (W, Fk) — broadcasts over leading (D, B) or (B,) dims
+        scale = torch.rsqrt(self.psd.clamp(min=1e-12))   # (W, Fk)
+        X_w = X.clone()
+        X_w[..., :Fk] = X_w[..., :Fk] * scale
+        return X_w
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -407,12 +465,16 @@ class SpectralTokenizer(nn.Module):
         tokens : Tensor, shape (B, W, K, 5) or (W, K, 5)
             Raw values per peak: [freq, dlnf, amp, phase_start, phase_end].
             W = number of time windows, K = n_peaks.
+            When whitening is active, amp is SNR (amplitude / sqrt(PSD)).
         """
         squeeze = x.dim() == 1
         if squeeze:
             x = x.unsqueeze(0)
 
         X = self.decomposer(x, dlnf=self.dlnf_grid)  # (D, B, W, k)
+
+        if self.psd is not None:
+            X = self._whiten(X)
 
         peaks, freq, dlnf, amp = self.decomposer.find_peaks(
             X, K=self.n_peaks, dlnf_grid=self.dlnf_grid, radius=self.radius)
