@@ -48,7 +48,7 @@ Each token represents one spectral peak in one time window, with 5 raw features:
 |---|---|
 | `freq` | Fractional frequency bin index (parabolic-interpolated) |
 | `dlnf` | Relative chirp rate (d ln f / dt, interpolated) |
-| `amp` | Peak amplitude |
+| `amp` | Peak amplitude (or SNR when whitening is active) |
 | `phase_start` | Phase at half-window start (t = -0.5) |
 | `phase_end` | Phase at half-window end (t = +0.5) |
 
@@ -59,6 +59,19 @@ Phase boundaries overlap between adjacent windows: `phase_end[w] = phase_start[w
 - `n_peaks` — Peaks per time window (default 3)
 - `radius` — Peak suppression radius for local-max detection (default 2)
 - `n_dlnf`, `dlnf_min`, `dlnf_max` — De-chirp grid (default 11 points, 0.0 to 0.05)
+- `noise_std` — Pre-computed noise std per bin, shape `(W, Fk)` where `Fk = k // 2 + 1` (default None = no whitening)
+
+**Whitening:** Divides the STFT by noise std before peak detection, so amplitudes become SNR-like. Two ways to set the noise std:
+
+```python
+# Option 1: Pre-computed noise std
+tokenizer = SpectralTokenizer(k=1024, noise_std=my_std)  # my_std: (W, Fk)
+
+# Option 2: Streaming EMA from data
+tokenizer = SpectralTokenizer(k=1024)
+tokenizer.update_noise_std(noise_batch)          # first call sets noise_std
+tokenizer.update_noise_std(noise_batch2, momentum=0.99)  # subsequent calls EMA-update
+```
 
 ### `TokenEmbedding` — Feature transforms + normalization
 
