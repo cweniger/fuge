@@ -260,16 +260,15 @@ class SpectralDecomposer(nn.Module):
                     freq_refined: torch.Tensor, dlnf_refined: torch.Tensor,
                     dlnf_grid: torch.Tensor,
                     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Estimate phase at hop boundaries for each detected peak.
+        """Estimate phase at half-window boundaries for each peak.
 
-        Uses the complex STFT value at the integer peak bin, corrects for
-        the fractional-bin offset (Hann-window phase centre), then
-        propagates the phase forward by one hop accounting for the chirp.
+        Returns phase_start and phase_end at the ±0.5 points of the
+        Hann window (samples k/4 and 3k/4).  With 50% overlap,
+        phase_end[w] coincides with phase_start[w+1], so the phases
+        tile the signal without gaps.
 
-        The de-chirp resampling shifts the apparent frequency:
-            f_dechirped = f_original * (exp(2*dlnf) - 1) / (2*dlnf)
-        so freq_refined must be converted back to f_original before
-        computing the phase increment.
+        phase_center (at the window midpoint) can be recovered as
+        (phase_start + phase_end) / 2.
 
         Parameters
         ----------
@@ -285,10 +284,11 @@ class SpectralDecomposer(nn.Module):
 
         Returns
         -------
-        phi_0 : Tensor, shape (N_WINDOWS, K)
-            Phase at the start of each window.
-        phi_1 : Tensor, shape (N_WINDOWS, K)
-            Phase propagated forward by one hop (= start of next window).
+        phase_start : Tensor, shape (N_WINDOWS, K)
+            Phase at sample k/4 (t = -0.5 in Hann window coords).
+        phase_end : Tensor, shape (N_WINDOWS, K)
+            Phase at sample 3k/4 (t = +0.5 in Hann window coords).
+            phase_end[w] = phase_start[w+1] for noiseless signals.
         """
         dlnf_idx = peaks[:, :, 0]
         freq_idx = peaks[:, :, 1]
@@ -298,37 +298,15 @@ class SpectralDecomposer(nn.Module):
         flat_idx = dlnf_idx * X.shape[2] + freq_idx        # (W, K)
         X_peak = Xp.gather(1, flat_idx)                     # (W, K) complex
 
-        # Phase at window start, corrected for fractional bin offset.
-        # For Hann window with centre at sample (k-1)/2, a fractional
-        # offset delta introduces phase pi * delta * (k-1) / k.
+        # Phase at window start (sample 0), corrected for fractional bin offset.
         f_delta = freq_refined - freq_idx.float()
-        phi_start = X_peak.angle() - torch.pi * f_delta * (self.k - 1) / self.k
+        phi_0 = X_peak.angle() - torch.pi * f_delta * (self.k - 1) / self.k
 
-        # --- Convert de-chirped freq to original freq at window start ---
-        # De-chirping with beta = 2*dlnf_used maps f_original to
-        # f_dechirp = f_original * (exp(beta) - 1) / beta
-        # so f_original = f_dechirp * beta / (exp(beta) - 1)
-        dlnf_used = dlnf_grid[dlnf_idx]                     # (W, K)
-        beta = 2.0 * dlnf_used
-        safe_beta = torch.where(beta.abs() < 1e-8,
-                                 torch.ones_like(beta) * 1e-8, beta)
-        freq_correction = safe_beta / (torch.exp(safe_beta) - 1.0)
-        freq_correction = torch.where(beta.abs() < 1e-8,
-                                       torch.ones_like(freq_correction),
-                                       freq_correction)
-        f0_bin = freq_refined * freq_correction              # original freq in bins
+        # Advance to half-window boundaries using freq_refined (bin units).
+        # phase(n) = phi_0 + 2*pi * freq * n / k
+        # phase_start at n = k/4:  phi_0 + pi * freq / 2
+        # phase_end   at n = 3k/4: phi_0 + 3 * pi * freq / 2
+        phase_start = phi_0 + torch.pi * freq_refined / 2
+        phase_end = phi_0 + 3 * torch.pi * freq_refined / 2
 
-        # --- Phase increment over one hop ---
-        # integral_0^{T_hop} 2*pi * f0 * exp(dlnf_true * t/T_hop) dt
-        # = pi * f0_bin * (exp(dlnf_true) - 1) / dlnf_true
-        # (using f0_hz * T_hop = f0_bin / 2)
-        dl = dlnf_refined
-        safe_dl = torch.where(dl.abs() < 1e-10,
-                               torch.ones_like(dl) * 1e-10, dl)
-        chirp_factor = (torch.exp(dl) - 1.0) / safe_dl
-        chirp_factor = torch.where(dl.abs() < 1e-10,
-                                    torch.ones_like(chirp_factor), chirp_factor)
-
-        phase_inc = torch.pi * f0_bin * chirp_factor
-
-        return phi_start, phi_start + phase_inc
+        return phase_start, phase_end

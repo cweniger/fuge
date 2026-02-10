@@ -112,11 +112,11 @@ if __name__ == "__main__":
 
         peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
             X_grid, K=3, dlnf_grid=dlnf_grid)
-        phi_0, phi_1 = decomposer.peak_phases(
+        phase_start, phase_end = decomposer.peak_phases(
             X_grid, peaks, freq_refined, dlnf_refined, dlnf_grid)
 
-        # Phase residual: wrap(phi_0[w+1] - phi_1[w])
-        residual = phi_0[1:] - phi_1[:-1]
+        # Phase residual: wrap(phase_start[w+1] - phase_end[w])
+        residual = phase_start[1:] - phase_end[:-1]
         residual = ((residual + torch.pi) % (2 * torch.pi)) - torch.pi
         residual_np = residual.cpu().numpy()
         t_res = 0.5 * (t_centers[:-1] + t_centers[1:])
