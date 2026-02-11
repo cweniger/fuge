@@ -47,7 +47,7 @@ The `dlnf` parameter is per-hop and internally scaled by 2 for the full window. 
 
 ### `src/fuge/spectral/embedding.py` — `ToneTokenEmbedding(nn.Module)`
 
-Transforms raw spectral peak tokens (freq, dlnf, amp, phase_start, phase_end) into model-ready embedded features with z-score normalization. Previously named `TokenEmbedding`; a backwards-compat alias exists in `fuge.__init__`.
+Transforms raw tone tokens (f_start, f_end, amp, phase_start, phase_end) into model-ready embedded features with z-score normalization.
 
 ### `src/fuge/nn.py` — `TransformerEmbedding(nn.Module)`
 
