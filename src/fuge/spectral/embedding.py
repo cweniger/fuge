@@ -1,6 +1,6 @@
-"""Spectral token embedding: raw (B, W, K, 5) tokens -> (B, W*K, n_embed).
+"""Tone token embedding: raw (B, W, K, 5) tokens -> (B, W*K, n_embed).
 
-Transforms raw spectral peak features (freq, dlnf, amp, phase_start,
+Transforms raw tone features (f_start, f_end, amp, phase_start,
 phase_end) into model-ready embedded features with z-score normalization.
 """
 
@@ -50,18 +50,18 @@ class ToneTokenEmbedding(nn.Module):
 
         (B, W, K, 5) -> (B, W, K, n_embed)
         """
-        freq = raw_tokens[..., 0]
-        dlnf = raw_tokens[..., 1]
+        f_start = raw_tokens[..., 0]
+        f_end = raw_tokens[..., 1]
         amp = torch.log1p(raw_tokens[..., 2])
         ps = raw_tokens[..., 3]
         pe = raw_tokens[..., 4]
 
         if self.phase_mode == "center":
             phi = (ps + pe) / 2
-            out = torch.stack([freq, dlnf, amp,
+            out = torch.stack([f_start, f_end, amp,
                                torch.cos(phi), torch.sin(phi)], dim=-1)
         else:
-            out = torch.stack([freq, dlnf, amp,
+            out = torch.stack([f_start, f_end, amp,
                                torch.cos(ps), torch.sin(ps),
                                torch.cos(pe), torch.sin(pe)], dim=-1)
 
