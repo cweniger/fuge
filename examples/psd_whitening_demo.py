@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-from fuge import SpectralTokenizer, TokenEmbedding, TransformerEmbedding
+from fuge import ToneTokenizer, ToneTokenEmbedding, TransformerEmbedding
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000
@@ -257,8 +257,9 @@ class EMRITokenDataset(Dataset):
 
 
 class EMRIModel(nn.Module):
-    def __init__(self, backbone, n_out, dropout=0.1):
+    def __init__(self, token_emb, backbone, n_out, dropout=0.1):
         super().__init__()
+        self.token_emb = token_emb
         self.backbone = backbone
         self.head = nn.Sequential(
             nn.LayerNorm(backbone.d_model),
@@ -269,7 +270,8 @@ class EMRIModel(nn.Module):
             nn.Sigmoid(),
         )
     def forward(self, x):
-        return self.head(self.backbone(x))
+        embedded, _, _ = self.token_emb(x)
+        return self.head(self.backbone(embedded))
 
 
 # =====================================================================
@@ -325,7 +327,7 @@ def evaluate(model, val_loader, device):
 
 def build_and_train(train_tokens, val_tokens, train_params, val_params,
                     device, label):
-    token_emb = TokenEmbedding(phase_mode=PHASE_MODE).double().to(device)
+    token_emb = ToneTokenEmbedding(phase_mode=PHASE_MODE).double().to(device)
     token_emb.compute_normalization(train_tokens)
 
     train_targets = torch.from_numpy(
@@ -341,12 +343,13 @@ def build_and_train(train_tokens, val_tokens, train_params, val_params,
         batch_size=BATCH_SIZE)
 
     n_windows = train_tokens.shape[1]
+    seq_len = n_windows * N_PEAKS
     backbone = TransformerEmbedding(
-        token_embedding=token_emb, n_windows=n_windows, n_peaks=N_PEAKS,
+        d_in=token_emb.n_embed, seq_len=seq_len,
         d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS,
         d_ff=D_FF, dropout=DROPOUT,
     ).double().to(device)
-    model = EMRIModel(backbone, n_out=N_PARAMS, dropout=DROPOUT
+    model = EMRIModel(token_emb, backbone, n_out=N_PARAMS, dropout=DROPOUT
                       ).double().to(device)
     print(f"  [{label}] Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -514,12 +517,12 @@ if __name__ == "__main__":
     val_colored = val_signals + val_noise_c
 
     # ── 4. Build tokenizers ──────────────────────────────────────────
-    tok_plain = SpectralTokenizer(
+    tok_plain = ToneTokenizer(
         k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double().to(device)
 
-    tok_psd = SpectralTokenizer(
+    tok_psd = ToneTokenizer(
         k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double().to(device)
