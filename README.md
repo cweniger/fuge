@@ -44,17 +44,17 @@ Chains de-chirped STFT, peak finding, and phase extraction into a single batched
 (B, N) signal -> (B, W, K, 5) raw tokens
 ```
 
-Each token represents one spectral peak in one time window, with 5 raw features:
+Each token represents one tone in one time window, with 5 raw features:
 
 | Feature | Description |
 |---|---|
-| `freq` | Fractional frequency bin index (parabolic-interpolated) |
-| `dlnf` | Relative chirp rate (d ln f / dt, interpolated) |
+| `f_start` | Frequency bin index at half-window start (t = -0.5) |
+| `f_end` | Frequency bin index at half-window end (t = +0.5) |
 | `amp` | Peak amplitude (or SNR when whitening is active) |
 | `phase_start` | Phase at half-window start (t = -0.5) |
 | `phase_end` | Phase at half-window end (t = +0.5) |
 
-Phase boundaries overlap between adjacent windows: `phase_end[w] = phase_start[w+1]` for clean signals.
+All boundary values tile across adjacent windows: `f_end[w] = f_start[w+1]` and `phase_end[w] = phase_start[w+1]` for clean signals.
 
 **Constructor parameters:**
 - `k` — Window size / FFT size (default 1024)
@@ -150,4 +150,4 @@ fuge/
 
 **Modular embedding design:** Each embedding type lives in its own subpackage (e.g. `fuge.spectral`). Generic neural network components live in `fuge.nn` and accept pre-embedded tensors of any dimension, making them reusable across embedding types.
 
-**Token design:** Phases are defined at half-window boundaries so they tile the signal without gaps. The `phase_center` can be recovered as `(phase_start + phase_end) / 2`. With 50% Hann window overlap, `phase_end[w]` coincides exactly with `phase_start[w+1]` for noiseless signals, enabling coherent phase tracking across windows.
+**Token design:** Both frequency and phase are defined at half-window boundaries so they tile the signal without gaps. With 50% Hann window overlap, `f_end[w] ≈ f_start[w+1]` and `phase_end[w] ≈ phase_start[w+1]` for noiseless signals, enabling coherent tracking across windows. Center values can be recovered as `(start + end) / 2`.

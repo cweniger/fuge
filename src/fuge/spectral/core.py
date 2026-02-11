@@ -377,7 +377,10 @@ class ToneTokenizer(nn.Module):
     Output
     ------
     forward(x) returns raw tokens of shape (B, N_WINDOWS, n_peaks, 5)
-    with 5 values per peak: [freq, dlnf, amp, phase_start, phase_end].
+    with 5 values per peak: [f_start, f_end, amp, phase_start, phase_end].
+    f_start and f_end are fractional frequency bin indices at the half-window
+    boundaries (t = -0.5 and t = +0.5 in Hann window coords).  For adjacent
+    windows, f_end[w] ≈ f_start[w+1] for clean signals.
     When whitening is active, amp reflects SNR (amplitude / noise_std).
     """
 
@@ -463,8 +466,9 @@ class ToneTokenizer(nn.Module):
         Returns
         -------
         tokens : Tensor, shape (B, W, K, 5) or (W, K, 5)
-            Raw values per peak: [freq, dlnf, amp, phase_start, phase_end].
-            W = number of time windows, K = n_peaks.
+            Raw values per peak: [f_start, f_end, amp, phase_start, phase_end].
+            f_start/f_end are fractional frequency bin indices at half-window
+            boundaries.  W = number of time windows, K = n_peaks.
             When whitening is active, amp is SNR (amplitude / noise_std).
         """
         squeeze = x.dim() == 1
@@ -481,7 +485,12 @@ class ToneTokenizer(nn.Module):
         ps, pe = self.decomposer.peak_phases(
             X, peaks, freq, dlnf, self.dlnf_grid)
 
-        tokens = torch.stack([freq, dlnf, amp, ps, pe], dim=-1)  # (B, W, K, 5)
+        # Frequency at half-window boundaries (dlnf is per hop,
+        # boundaries are ±0.5 hops from center)
+        f_start = freq * torch.exp(-dlnf / 2)
+        f_end = freq * torch.exp(dlnf / 2)
+
+        tokens = torch.stack([f_start, f_end, amp, ps, pe], dim=-1)  # (B, W, K, 5)
 
         if squeeze:
             tokens = tokens.squeeze(0)
