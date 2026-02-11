@@ -1,11 +1,11 @@
-"""fuge: Gravitational wave signal analysis toolkit."""
+"""fuge: Scientific signal embeddings."""
 
-from fuge.spectral import SpectralDecomposer, SpectralTokenizer
-from fuge.embedding import TokenEmbedding, TransformerEmbedding
+from fuge.spectral import DechirpSTFT, ToneTokenizer, ToneTokenEmbedding
+from fuge.nn import TransformerEmbedding
 from fuge.emri import emri_signal
 
 __all__ = [
-    "SpectralDecomposer", "SpectralTokenizer",
-    "TokenEmbedding", "TransformerEmbedding",
+    "DechirpSTFT", "ToneTokenizer", "ToneTokenEmbedding",
+    "TransformerEmbedding",
     "emri_signal",
 ]

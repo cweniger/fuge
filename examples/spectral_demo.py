@@ -6,7 +6,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 import torch
 
-from fuge import SpectralDecomposer
+from fuge import DechirpSTFT
 
 if __name__ == "__main__":
     # Inline test signal (PN-inspired chirp, no JAX dependency)
@@ -28,7 +28,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     k = 4096
-    decomposer = SpectralDecomposer(k=k).to(device)
+    decomposer = DechirpSTFT(k=k).to(device)
     noise_rms = np.sqrt(k * 3.0 / 8.0)
 
     # --- dlnf grid hyperparameters ---

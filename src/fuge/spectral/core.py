@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SpectralDecomposer(nn.Module):
+class DechirpSTFT(nn.Module):
     """STFT with half-overlapping Hann windows and optional de-chirping.
 
     Parameters
@@ -351,10 +351,10 @@ class SpectralDecomposer(nn.Module):
         return phase_start, phase_end
 
 
-class SpectralTokenizer(nn.Module):
+class ToneTokenizer(nn.Module):
     """Tokenize time-domain signals into spectral peak features.
 
-    Wraps SpectralDecomposer and chains STFT -> peak finding -> phase
+    Wraps DechirpSTFT and chains STFT -> peak finding -> phase
     extraction into a single batched forward pass.  Optionally whitens
     the STFT by estimated noise std before peak detection.
 
@@ -385,7 +385,7 @@ class SpectralTokenizer(nn.Module):
                  n_dlnf: int = 11, dlnf_min: float = 0.0, dlnf_max: float = 0.05,
                  noise_std: torch.Tensor = None):
         super().__init__()
-        self.decomposer = SpectralDecomposer(k=k)
+        self.decomposer = DechirpSTFT(k=k)
         self.n_peaks = n_peaks
         self.radius = radius
         self.register_buffer(

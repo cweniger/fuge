@@ -1,6 +1,6 @@
 # fuge
 
-Spectral tokenization toolkit for gravitational wave signals. Converts time-domain data into compact spectral tokens suitable for transformer-based inference, designed as an embedding layer for Simulation-Based Inference (SBI).
+Scientific signal embeddings toolkit. Converts time-domain data into compact tokens suitable for transformer-based inference, designed as an embedding layer for Simulation-Based Inference (SBI).
 
 ## Installation
 
@@ -14,27 +14,29 @@ Requires Python 3.10+, PyTorch, JAX, NumPy, Matplotlib.
 
 ```python
 import torch
-from fuge import SpectralTokenizer, TokenEmbedding, TransformerEmbedding
+from fuge import ToneTokenizer, ToneTokenEmbedding, TransformerEmbedding
 
 # 1. Tokenize: time-domain signal -> raw spectral tokens
-tokenizer = SpectralTokenizer(k=1024, n_peaks=3).to(device)
+tokenizer = ToneTokenizer(k=1024, n_peaks=3).to(device)
 tokens = tokenizer(signals)  # (B, N) -> (B, W, K, 5)
 
-# 2. Embed: raw tokens -> fixed-size vector for downstream tasks
-token_emb = TokenEmbedding(phase_mode="center")
+# 2. Embed: raw tokens -> model-ready features
+token_emb = ToneTokenEmbedding(phase_mode="center")
 token_emb.compute_normalization(train_tokens)
+embedded, n_windows, n_peaks = token_emb(tokens)  # (B, W*K, n_embed)
 
+# 3. Encode: embedded features -> fixed-size vector
 backbone = TransformerEmbedding(
-    token_emb, n_windows=W, n_peaks=3, d_model=64,
+    d_in=token_emb.n_embed, seq_len=W * K, d_model=64,
 )
-embedding = backbone(tokens)  # (B, W, K, 5) -> (B, d_model)
+embedding = backbone(embedded)  # (B, seq_len, d_in) -> (B, d_model)
 
 # Use `embedding` as input to SBI posterior network, regression head, etc.
 ```
 
 ## Core modules
 
-### `SpectralTokenizer` — Signal to tokens
+### `ToneTokenizer` — Signal to tokens
 
 Chains de-chirped STFT, peak finding, and phase extraction into a single batched `forward()` call.
 
@@ -65,15 +67,15 @@ Phase boundaries overlap between adjacent windows: `phase_end[w] = phase_start[w
 
 ```python
 # Option 1: Pre-computed noise std
-tokenizer = SpectralTokenizer(k=1024, noise_std=my_std)  # my_std: (W, Fk)
+tokenizer = ToneTokenizer(k=1024, noise_std=my_std)  # my_std: (W, Fk)
 
 # Option 2: Streaming EMA from data
-tokenizer = SpectralTokenizer(k=1024)
+tokenizer = ToneTokenizer(k=1024)
 tokenizer.update_noise_std(noise_batch)          # first call sets noise_std
 tokenizer.update_noise_std(noise_batch2, momentum=0.99)  # subsequent calls EMA-update
 ```
 
-### `TokenEmbedding` — Feature transforms + normalization
+### `ToneTokenEmbedding` — Feature transforms + normalization
 
 Transforms raw token values into model-ready features: `log1p` on amplitude, `cos/sin` on phases, then z-score normalization. Each peak becomes an independent token in the sequence.
 
@@ -86,17 +88,17 @@ Transforms raw token values into model-ready features: `log1p` on amplitude, `co
 
 Call `compute_normalization(train_tokens)` once on training data before use.
 
-### `TransformerEmbedding` — Tokens to fixed-size vector
+### `TransformerEmbedding` — Embedded tokens to fixed-size vector
 
-Transformer encoder backbone that maps raw tokens to a fixed-size summary vector. Uses **time-only positional encoding** shared across all peaks within the same window — peak identity comes from its features (freq, dlnf, amp), not from ordering.
+Generic transformer encoder backbone that maps pre-embedded tokens to a fixed-size summary vector. Accepts any `(B, seq_len, d_in)` input — not coupled to any specific embedding type.
 
 ```
-(B, W, K, 5) raw tokens -> (B, d_model) embedding vector
+(B, seq_len, d_in) embedded tokens -> (B, d_model) embedding vector
 ```
 
 Designed as a drop-in embedding network for SBI frameworks.
 
-### `SpectralDecomposer` — Low-level STFT
+### `DechirpSTFT` — Low-level STFT
 
 The underlying STFT engine with two de-chirp modes:
 
@@ -128,18 +130,24 @@ JAX_PLATFORMS=cpu python examples/emri_demo.py
 ```
 fuge/
 ├── src/fuge/
-│   ├── spectral.py      # SpectralDecomposer, SpectralTokenizer
-│   ├── embedding.py     # TokenEmbedding, TransformerEmbedding
-│   └── emri.py          # emri_signal (JAX)
+│   ├── __init__.py              # top-level convenience re-exports
+│   ├── nn.py                    # TransformerEmbedding (generic)
+│   ├── spectral/
+│   │   ├── core.py              # DechirpSTFT, ToneTokenizer
+│   │   └── embedding.py         # ToneTokenEmbedding
+│   └── emri.py                  # emri_signal (JAX)
 └── examples/
-    ├── transformer_demo.py   # End-to-end parameter estimation
-    ├── spectral_demo.py      # STFT + peak visualization
-    ├── fisher_demo.py        # Fisher matrix / CRB analysis
-    └── emri_demo.py          # Waveform generator demo
+    ├── transformer_demo.py       # End-to-end parameter estimation
+    ├── psd_whitening_demo.py     # Colored noise whitening comparison
+    ├── spectral_demo.py          # STFT + peak visualization
+    ├── fisher_demo.py            # Fisher matrix / CRB analysis
+    └── emri_demo.py              # Waveform generator demo
 ```
 
 ## Architecture notes
 
 **Dual-framework design:** PyTorch for signal analysis (STFT, tokenization, transformer), JAX for signal synthesis (waveform generation with autodiff). This split is intentional — PyTorch handles efficient batched GPU tensor operations, while JAX provides automatic differentiation through the waveform model for Fisher information computation.
+
+**Modular embedding design:** Each embedding type lives in its own subpackage (e.g. `fuge.spectral`). Generic neural network components live in `fuge.nn` and accept pre-embedded tensors of any dimension, making them reusable across embedding types.
 
 **Token design:** Phases are defined at half-window boundaries so they tile the signal without gaps. The `phase_center` can be recovered as `(phase_start + phase_end) / 2`. With 50% Hann window overlap, `phase_end[w]` coincides exactly with `phase_start[w+1]` for noiseless signals, enabling coherent phase tracking across windows.

@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-from fuge import SpectralTokenizer, TokenEmbedding, TransformerEmbedding, emri_signal
+from fuge import ToneTokenizer, ToneTokenEmbedding, TransformerEmbedding, emri_signal
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000
@@ -93,7 +93,7 @@ def generate_dataset(n_signals, rng):
 TOKENIZE_BATCH = 64  # signals per GPU batch during tokenization
 
 def tokenize_signals(signals, tokenizer, device):
-    """Tokenize signals in batches using SpectralTokenizer."""
+    """Tokenize signals in batches using ToneTokenizer."""
     all_tokens = []
     for start in range(0, len(signals), TOKENIZE_BATCH):
         batch = torch.from_numpy(signals[start:start + TOKENIZE_BATCH]).to(
@@ -126,10 +126,11 @@ class EMRITokenDataset(Dataset):
 # =====================================================================
 
 class EMRIModel(nn.Module):
-    """TransformerEmbedding backbone + regression head for demo."""
+    """ToneTokenEmbedding + TransformerEmbedding backbone + regression head."""
 
-    def __init__(self, backbone, n_out, dropout=0.1):
+    def __init__(self, token_emb, backbone, n_out, dropout=0.1):
         super().__init__()
+        self.token_emb = token_emb
         self.backbone = backbone
         self.head = nn.Sequential(
             nn.LayerNorm(backbone.d_model),
@@ -141,7 +142,8 @@ class EMRIModel(nn.Module):
         )
 
     def forward(self, x):
-        return self.head(self.backbone(x))
+        embedded, _, _ = self.token_emb(x)
+        return self.head(self.backbone(embedded))
 
 
 # =====================================================================
@@ -276,7 +278,7 @@ if __name__ == "__main__":
 
     # 3. Tokenize
     print("Tokenizing signals...")
-    tokenizer = SpectralTokenizer(
+    tokenizer = ToneTokenizer(
         k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double().to(device)
@@ -287,8 +289,8 @@ if __name__ == "__main__":
     print(f"  Token shape: {train_tokens.shape}")
 
     # 4. Build token embedding and compute normalization
-    token_emb = TokenEmbedding(phase_mode=PHASE_MODE,
-                               mask_phases=MASK_PHASES).double().to(device)
+    token_emb = ToneTokenEmbedding(phase_mode=PHASE_MODE,
+                                      mask_phases=MASK_PHASES).double().to(device)
     token_emb.compute_normalization(train_tokens)
 
     # Move raw tokens to CPU for DataLoader
@@ -311,12 +313,13 @@ if __name__ == "__main__":
 
     # 6. Model: backbone + head
     n_windows = train_tokens.shape[1]
+    seq_len = n_windows * N_PEAKS
     backbone = TransformerEmbedding(
-        token_embedding=token_emb, n_windows=n_windows, n_peaks=N_PEAKS,
+        d_in=token_emb.n_embed, seq_len=seq_len,
         d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS,
         d_ff=D_FF, dropout=DROPOUT,
     ).double().to(device)
-    model = EMRIModel(backbone, n_out=N_PARAMS, dropout=DROPOUT
+    model = EMRIModel(token_emb, backbone, n_out=N_PARAMS, dropout=DROPOUT
                       ).double().to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
