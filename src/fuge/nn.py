@@ -31,15 +31,19 @@ class TransformerEmbedding(nn.Module):
         Dropout rate.
     """
 
-    def __init__(self, d_in, seq_len, d_model=64,
+    def __init__(self, d_in, seq_len=None, d_model=64,
                  n_heads=4, n_layers=3, d_ff=256, dropout=0.1):
         super().__init__()
         self.input_proj = nn.Linear(d_in, d_model)
         self.d_model = d_model
 
-        # Learnable positional encoding over the full sequence
-        self.pos_encoding = nn.Parameter(
-            torch.randn(1, seq_len, d_model) * 0.02)
+        # Learnable positional encoding — created lazily on first forward
+        # if seq_len is not given, otherwise pre-allocated.
+        if seq_len is not None:
+            self.pos_encoding = nn.Parameter(
+                torch.randn(1, seq_len, d_model) * 0.02)
+        else:
+            self.pos_encoding = None
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
@@ -60,6 +64,10 @@ class TransformerEmbedding(nn.Module):
         embedding : Tensor, shape (B, d_model)
         """
         projected = self.input_proj(x)           # (B, seq_len, d_model)
+        if self.pos_encoding is None or self.pos_encoding.shape[1] != projected.shape[1]:
+            self.pos_encoding = nn.Parameter(
+                torch.randn(1, projected.shape[1], self.d_model,
+                             device=projected.device, dtype=projected.dtype) * 0.02)
         projected = projected + self.pos_encoding
         x = self.encoder(projected)
         return x.mean(dim=1)                     # (B, d_model)
