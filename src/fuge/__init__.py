@@ -3,9 +3,11 @@
 from fuge.spectral import DechirpSTFT, ToneTokenizer, ToneTokenEmbedding
 from fuge.nn import TransformerEmbedding
 from fuge.emri import emri_signal
+from fuge.svd import PCAProjector
 
 __all__ = [
     "DechirpSTFT", "ToneTokenizer", "ToneTokenEmbedding",
     "TransformerEmbedding",
     "emri_signal",
+    "PCAProjector",
 ]
