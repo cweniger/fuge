@@ -1,6 +1,6 @@
 """PSD whitening demo: colored noise + Fisher CRB + NN estimation.
 
-Generates EMRI signals with colored noise (mild 1/f^2 spectrum), computes
+Generates chirp signals with colored noise (mild 1/f^2 spectrum), computes
 the Cramér-Rao bound using the noise-weighted inner product, and trains
 three transformer models to compare:
   1. White noise (sigma=1) — baseline
@@ -17,7 +17,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-from fuge import ToneTokenizer, ToneTokenEmbedding, TransformerEmbedding
+from fuge.spectral import ToneTokenizer, ToneTokenEmbedding
+from fuge.nn import TransformerEmbedding
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000
@@ -134,8 +135,8 @@ def generate_colored_noise(n_signals, N, T_obs, psd_func, rng):
 # Signal generation (pure numpy, no JAX dependency)
 # =====================================================================
 
-def _emri_numpy(f0, chirp_mass, t_c, A0, harmonic_decay, n_harmonics, N, T_obs):
-    """Generate EMRI signal in numpy (matching fuge.emri but without JAX)."""
+def _chirp_numpy(f0, chirp_mass, t_c, A0, harmonic_decay, n_harmonics, N, T_obs):
+    """Generate chirp signal in numpy (no JAX dependency)."""
     t = np.linspace(0, T_obs, N)
     dt = T_obs / (N - 1)
     tau = 1.0 - t / t_c
@@ -159,14 +160,14 @@ def _jacobian(params, N, T_obs, n_harmonics):
     p_list = [f0, cm, hd]
     eps = [1e-12, 1e-8, 1e-6]  # tuned per parameter scale
 
-    h0 = _emri_numpy(f0, cm, T_C, A0, hd, n_harmonics, N, T_obs)
+    h0 = _chirp_numpy(f0, cm, T_C, A0, hd, n_harmonics, N, T_obs)
     jac = np.zeros((N, 3))
     for i, e in enumerate(eps):
         args_p = list(p_list); args_p[i] += e
         args_m = list(p_list); args_m[i] -= e
-        h_p = _emri_numpy(args_p[0], args_p[1], T_C, A0, args_p[2],
+        h_p = _chirp_numpy(args_p[0], args_p[1], T_C, A0, args_p[2],
                           n_harmonics, N, T_obs)
-        h_m = _emri_numpy(args_m[0], args_m[1], T_C, A0, args_m[2],
+        h_m = _chirp_numpy(args_m[0], args_m[1], T_C, A0, args_m[2],
                           n_harmonics, N, T_obs)
         jac[:, i] = (h_p - h_m) / (2.0 * e)
     return jac
@@ -221,7 +222,7 @@ def generate_dataset(n_signals, rng):
     ])
     signals = np.zeros((n_signals, N))
     for i in range(n_signals):
-        signals[i] = _emri_numpy(
+        signals[i] = _chirp_numpy(
             params[i, 0], params[i, 1], T_C, A0,
             params[i, 2], N_HARMONICS, N, T_OBS,
         )
@@ -246,7 +247,7 @@ def tokenize_signals(signals, tokenizer, device):
 # Dataset and Model
 # =====================================================================
 
-class EMRITokenDataset(Dataset):
+class chirpTokenDataset(Dataset):
     def __init__(self, tokens, targets):
         self.tokens = tokens
         self.targets = targets
@@ -256,7 +257,7 @@ class EMRITokenDataset(Dataset):
         return self.tokens[idx], self.targets[idx]
 
 
-class EMRIModel(nn.Module):
+class chirpModel(nn.Module):
     def __init__(self, token_emb, backbone, n_out, dropout=0.1):
         super().__init__()
         self.token_emb = token_emb
@@ -336,10 +337,10 @@ def build_and_train(train_tokens, val_tokens, train_params, val_params,
         (val_params - PARAM_MIN) / (PARAM_MAX - PARAM_MIN)).double()
 
     train_loader = DataLoader(
-        EMRITokenDataset(train_tokens.cpu(), train_targets),
+        chirpTokenDataset(train_tokens.cpu(), train_targets),
         batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(
-        EMRITokenDataset(val_tokens.cpu(), val_targets),
+        chirpTokenDataset(val_tokens.cpu(), val_targets),
         batch_size=BATCH_SIZE)
 
     n_windows = train_tokens.shape[1]
@@ -349,7 +350,7 @@ def build_and_train(train_tokens, val_tokens, train_params, val_params,
         d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS,
         d_ff=D_FF, dropout=DROPOUT,
     ).double().to(device)
-    model = EMRIModel(token_emb, backbone, n_out=N_PARAMS, dropout=DROPOUT
+    model = chirpModel(token_emb, backbone, n_out=N_PARAMS, dropout=DROPOUT
                       ).double().to(device)
     print(f"  [{label}] Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -492,7 +493,7 @@ if __name__ == "__main__":
         print(f"    {name:16s}: {crb_colored[i] / crb_white[i]:.1f}x")
 
     # ── 2. Generate clean signals ────────────────────────────────────
-    print(f"\nGenerating {N_TRAIN + N_VAL} EMRI signals...")
+    print(f"\nGenerating {N_TRAIN + N_VAL} chirp signals...")
     t0 = time.time()
     all_signals, all_params = generate_dataset(N_TRAIN + N_VAL, rng)
     print(f"  Done in {time.time() - t0:.1f}s")

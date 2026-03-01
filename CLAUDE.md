@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Scientific signal embeddings toolkit, installable as the `fuge` Python package. Modular architecture supports multiple embedding types (spectral, streaming SVD, etc.) with shared neural network infrastructure.
 
 - **`src/fuge/spectral/`** — Spectral analysis subpackage: STFT with de-chirping, tokenization, and spectral token embedding
+- **`src/fuge/svd/`** — Streaming PCA with Procrustes-stabilized output (StreamingPCA)
 - **`src/fuge/nn.py`** — Generic neural network building blocks (TransformerEmbedding)
-- **`src/fuge/emri.py`** — JAX-based synthetic EMRI (Extreme Mass Ratio Inspiral) waveform generator with autodiff support
 
 ## Installation
 
@@ -22,8 +22,11 @@ pip install -e .
 # Run spectral decomposition demo (generates spectral_demo.png, peaks_demo.png)
 python examples/spectral_demo.py
 
-# Run EMRI signal generator demo (generates emri_demo.png)
-python examples/emri_demo.py
+# Run chirp signal generator demo (generates chirp_demo.png)
+python examples/chirp_demo.py
+
+# Run streaming PCA demo (generates svd_demo_procrustes.png, svd_demo_wiener.png)
+python examples/svd_demo.py
 ```
 
 There is no formal test suite. Demo scripts live in `examples/`. No build system, linting, or CI is configured beyond `pyproject.toml`.
@@ -32,7 +35,7 @@ There is no formal test suite. Demo scripts live in `examples/`. No build system
 
 **Dual-framework design:** PyTorch for signal analysis, JAX for signal synthesis. This split is intentional — PyTorch handles efficient GPU tensor operations for STFT windowing, while JAX provides automatic differentiation through the waveform model for parameter optimization.
 
-**Modular embedding design:** Each embedding type (spectral, future SVD, etc.) lives in its own subpackage under `src/fuge/`. Generic neural network components (e.g. `TransformerEmbedding`) live in `src/fuge/nn.py` and accept pre-embedded tensors of any `d_in` dimension.
+**Modular embedding design:** Each embedding type lives in its own subpackage under `src/fuge/`. Generic neural network components (e.g. `TransformerEmbedding`) live in `src/fuge/nn.py` and accept pre-embedded tensors of any `d_in` dimension. Import via explicit subpackage: `fuge.spectral.*`, `fuge.svd.*`, `fuge.nn.*`.
 
 ### `src/fuge/spectral/core.py` — `DechirpSTFT(nn.Module)`, `ToneTokenizer(nn.Module)`
 
@@ -49,15 +52,13 @@ The `dlnf` parameter is per-hop and internally scaled by 2 for the full window. 
 
 Transforms raw tone tokens (f_start, f_end, amp, phase_start, phase_end) into model-ready embedded features with z-score normalization.
 
+### `src/fuge/svd/core.py` — `StreamingPCA(nn.Module)`
+
+Streaming PCA with momentum-blended covariance updates via single SVD. Procrustes alignment stabilizes output for neural networks. Wiener filter provides optimal denoising assuming unit noise variance.
+
 ### `src/fuge/nn.py` — `TransformerEmbedding(nn.Module)`
 
 Generic transformer encoder backbone: accepts pre-embedded `(B, seq_len, d_in)` tensors, projects to `d_model`, adds learnable positional encoding, runs through transformer encoder layers, and returns a fixed-size `(B, d_model)` summary via global average pooling. Not coupled to any specific embedding type.
-
-### `src/fuge/emri.py` — `emri_signal()` / `_emri_impl()`
-
-Post-Newtonian inspired waveform: `f(t) = f₀(1 - t/t_c)^(-3/8 · chirp_mass)`, amplitude `A(t) = A₀(1 - t/t_c)^(-1/4)`, with harmonic sum `h(t) = Σ A_k(t) cos(k φ(t))`.
-
-Phase accumulated via trapezoidal integration (O(dt²)). Harmonics summed with `jax.lax.scan`. Core function `_emri_impl` is JIT-compiled with `n_harmonics` and `N` as static arguments.
 
 ## Package structure
 
@@ -69,21 +70,25 @@ fuge/
 ├── .gitignore
 ├── src/
 │   └── fuge/
-│       ├── __init__.py              # top-level convenience re-exports
+│       ├── __init__.py              # package docstring, no flat re-exports
 │       ├── nn.py                    # TransformerEmbedding (generic)
 │       ├── spectral/
 │       │   ├── __init__.py          # re-exports: DechirpSTFT, ToneTokenizer, ToneTokenEmbedding
 │       │   ├── core.py              # DechirpSTFT, ToneTokenizer
 │       │   └── embedding.py         # ToneTokenEmbedding
-│       └── emri.py
+│       └── svd/
+│           ├── __init__.py          # re-exports: StreamingPCA
+│           └── core.py              # StreamingPCA
 └── examples/
+    ├── chirp.py                     # test signal generator (JAX)
+    ├── chirp_demo.py
     ├── spectral_demo.py
     ├── transformer_demo.py
     ├── psd_whitening_demo.py
     ├── fisher_demo.py
-    └── emri_demo.py
+    └── svd_demo.py
 ```
 
 ## Dependencies
 
-Requires: `torch`, `jax`, `jaxlib`, `numpy`, `matplotlib`, `scipy`. Environment: Python 3.10+ via Conda (`emri_few_timm`). GPU (CUDA) supported by both frameworks but not required.
+Requires: `torch`, `jax`, `jaxlib`, `numpy`, `matplotlib`, `scipy`. Python 3.10+. GPU (CUDA) supported by both frameworks but not required.

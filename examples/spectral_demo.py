@@ -6,7 +6,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 import torch
 
-from fuge import DechirpSTFT
+from fuge.spectral import DechirpSTFT
 
 if __name__ == "__main__":
     # Inline test signal (PN-inspired chirp, no JAX dependency)

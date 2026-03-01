@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
 
-from fuge.emri import _emri_impl
+from chirp import _chirp_impl
 
 # ── Signal parameters (matching transformer_demo.py) ────────────────
 T_C = 1e6
@@ -42,7 +42,7 @@ def fisher_f0(f0):
     Returns F (scalar) and σ_CRB = 1/√F.
     """
     def signal(f0_):
-        return _emri_impl(f0_, CHIRP_MASS, T_C, A0, HARMONIC_DECAY,
+        return _chirp_impl(f0_, CHIRP_MASS, T_C, A0, HARMONIC_DECAY,
                           N_HARMONICS, N, T_OBS)
 
     # Forward-mode AD: get gradient ∂h/∂f0 as a (N,) vector

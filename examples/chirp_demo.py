@@ -1,4 +1,4 @@
-"""EMRI waveform generator demo: time/frequency domain plots and spectrogram."""
+"""Chirp signal generator demo: time/frequency domain plots and spectrogram."""
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,10 +6,9 @@ import jax
 import jax.numpy as jnp
 from scipy.signal import spectrogram
 
-from fuge.emri import emri_signal, _emri_impl
+from chirp import chirp_signal, _chirp_impl
 
 if __name__ == "__main__":
-    # Reasonable fake-EMRI parameters
     params = dict(
         f0=1e-3,            # 1 mHz initial frequency
         chirp_mass=1.0,     # standard PN exponent
@@ -20,13 +19,13 @@ if __name__ == "__main__":
         N=100_000,          # fewer points for quick plot
     )
 
-    h = emri_signal(**params)
+    h = chirp_signal(**params)
     T_obs = 0.9 * params["t_c"]
     t = np.linspace(0, T_obs, params["N"])
 
     # Test autodiff
     def loss(f0):
-        return jnp.sum(_emri_impl(f0, 1.0, 1e6, 1e-21, 1.5, 4, 10_000, 0.9e6))
+        return jnp.sum(_chirp_impl(f0, 1.0, 1e6, 1e-21, 1.5, 4, 10_000, 0.9e6))
     grad_f0 = jax.grad(loss)(1e-3)
     print(f"grad(sum(h)) w.r.t. f0 = {grad_f0:.6e}  (autodiff works)")
 
@@ -39,7 +38,6 @@ if __name__ == "__main__":
     axes[0, 0].set_title("Full waveform")
 
     # --- Top right: zoomed-in near the plunge ---
-    # Last 2% of observation time (near coalescence)
     plunge_frac = 0.02
     t_start = T_obs * (1.0 - plunge_frac)
     mask = t >= t_start
@@ -57,7 +55,7 @@ if __name__ == "__main__":
     axes[1, 0].set_title("Frequency domain")
 
     # --- Bottom right: spectrogram ---
-    fs = len(h) / T_obs  # sampling frequency
+    fs = len(h) / T_obs
     nperseg = min(2048, len(h) // 16)
     f_spec, t_spec, Sxx = spectrogram(h, fs=fs, nperseg=nperseg,
                                        noverlap=nperseg * 3 // 4)
@@ -68,11 +66,10 @@ if __name__ == "__main__":
     axes[1, 1].set_xlabel("t (s)")
     axes[1, 1].set_title("Spectrogram")
     axes[1, 1].set_yscale("log")
-    # Crop to the interesting frequency range
     f_max = params["f0"] * (params["n_harmonics"] + 1) * 5
     axes[1, 1].set_ylim(params["f0"] * 0.5, f_max)
     fig.colorbar(im, ax=axes[1, 1], label="PSD (dB)")
 
     plt.tight_layout()
-    plt.savefig("emri_demo.png", dpi=150)
-    print("Saved emri_demo.png")
+    plt.savefig("chirp_demo.png", dpi=150)
+    print("Saved chirp_demo.png")
