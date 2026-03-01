@@ -1,6 +1,6 @@
 # fuge
 
-Scientific signal embeddings toolkit. Converts time-domain data into compact tokens suitable for transformer-based inference, designed as an embedding layer for Simulation-Based Inference (SBI).
+Scientific signal embeddings toolkit. Converts time-domain data into compact representations suitable for neural network inference, designed as an embedding layer for Simulation-Based Inference (SBI).
 
 ## Installation
 
@@ -14,7 +14,8 @@ Requires Python 3.10+, PyTorch, JAX, NumPy, Matplotlib.
 
 ```python
 import torch
-from fuge import ToneTokenizer, ToneTokenEmbedding, TransformerEmbedding
+from fuge.spectral import ToneTokenizer, ToneTokenEmbedding
+from fuge.nn import TransformerEmbedding
 
 # 1. Tokenize: time-domain signal -> raw spectral tokens
 tokenizer = ToneTokenizer(k=1024, n_peaks=3).to(device)
@@ -36,7 +37,7 @@ embedding = backbone(embedded)  # (B, seq_len, d_in) -> (B, d_model)
 
 ## Core modules
 
-### `ToneTokenizer` — Signal to tokens
+### `fuge.spectral.ToneTokenizer` — Signal to tokens
 
 Chains de-chirped STFT, peak finding, and phase extraction into a single batched `forward()` call.
 
@@ -75,7 +76,7 @@ tokenizer.update_noise_std(noise_batch)          # first call sets noise_std
 tokenizer.update_noise_std(noise_batch2, momentum=0.99)  # subsequent calls EMA-update
 ```
 
-### `ToneTokenEmbedding` — Feature transforms + normalization
+### `fuge.spectral.ToneTokenEmbedding` — Feature transforms + normalization
 
 Transforms raw token values into model-ready features: `log1p` on amplitude, `cos/sin` on phases, then z-score normalization. Each peak becomes an independent token in the sequence.
 
@@ -88,7 +89,19 @@ Transforms raw token values into model-ready features: `log1p` on amplitude, `co
 
 Call `compute_normalization(train_tokens)` once on training data before use.
 
-### `TransformerEmbedding` — Embedded tokens to fixed-size vector
+### `fuge.svd.StreamingPCA` — Streaming PCA with Procrustes stabilization
+
+Streaming dimensionality reduction for whitened signals. Momentum-blended covariance updates via single SVD, Procrustes alignment for output stability, diagonal Wiener filter for denoising.
+
+```python
+from fuge.svd import StreamingPCA
+
+pca = StreamingPCA(n_components=32, buffer_size=256, momentum=0.1)
+pca.update(whitened_batch)       # streaming update
+coeffs = pca(whitened_x)         # (B, D) -> (B, 32), stable ~unit variance
+```
+
+### `fuge.nn.TransformerEmbedding` — Embedded tokens to fixed-size vector
 
 Generic transformer encoder backbone that maps pre-embedded tokens to a fixed-size summary vector. Accepts any `(B, seq_len, d_in)` input — not coupled to any specific embedding type.
 
@@ -98,31 +111,30 @@ Generic transformer encoder backbone that maps pre-embedded tokens to a fixed-si
 
 Designed as a drop-in embedding network for SBI frameworks.
 
-### `DechirpSTFT` — Low-level STFT
+### `fuge.spectral.DechirpSTFT` — Low-level STFT
 
 The underlying STFT engine with two de-chirp modes:
 
 - **Phase de-chirp** (`a`): `exp(-i a t^2)` multiplication removes constant absolute chirp rate
 - **Resample de-chirp** (`dlnf`): exponential time-grid warping removes constant relative chirp rate, de-chirping all harmonics simultaneously
 
-### `emri_signal` — Synthetic waveform generator
-
-JAX-based post-Newtonian EMRI waveform generator, differentiable w.r.t. all continuous parameters. Used for generating training data and Fisher information analysis.
-
 ## Examples
 
 ```bash
-# Transformer parameter estimation demo (3 params, ~2x CRB)
+# Transformer parameter estimation demo
 JAX_PLATFORMS=cpu python examples/transformer_demo.py
 
 # Spectral decomposition visualization
 python examples/spectral_demo.py
 
+# Streaming PCA demo (Procrustes stability + Wiener filter verification)
+python examples/svd_demo.py
+
 # Fisher information / Cramer-Rao bound analysis
 JAX_PLATFORMS=cpu python examples/fisher_demo.py
 
-# EMRI waveform generator demo
-JAX_PLATFORMS=cpu python examples/emri_demo.py
+# Chirp signal generator demo
+JAX_PLATFORMS=cpu python examples/chirp_demo.py
 ```
 
 ## Package structure
@@ -130,24 +142,27 @@ JAX_PLATFORMS=cpu python examples/emri_demo.py
 ```
 fuge/
 ├── src/fuge/
-│   ├── __init__.py              # top-level convenience re-exports
+│   ├── __init__.py              # package docstring, no flat re-exports
 │   ├── nn.py                    # TransformerEmbedding (generic)
 │   ├── spectral/
 │   │   ├── core.py              # DechirpSTFT, ToneTokenizer
 │   │   └── embedding.py         # ToneTokenEmbedding
-│   └── emri.py                  # emri_signal (JAX)
+│   └── svd/
+│       └── core.py              # StreamingPCA
 └── examples/
-    ├── transformer_demo.py       # End-to-end parameter estimation
-    ├── psd_whitening_demo.py     # Colored noise whitening comparison
-    ├── spectral_demo.py          # STFT + peak visualization
-    ├── fisher_demo.py            # Fisher matrix / CRB analysis
-    └── emri_demo.py              # Waveform generator demo
+    ├── chirp.py                  # Test signal generator (JAX)
+    ├── chirp_demo.py
+    ├── spectral_demo.py
+    ├── transformer_demo.py
+    ├── psd_whitening_demo.py
+    ├── fisher_demo.py
+    └── svd_demo.py
 ```
 
 ## Architecture notes
 
 **Dual-framework design:** PyTorch for signal analysis (STFT, tokenization, transformer), JAX for signal synthesis (waveform generation with autodiff). This split is intentional — PyTorch handles efficient batched GPU tensor operations, while JAX provides automatic differentiation through the waveform model for Fisher information computation.
 
-**Modular embedding design:** Each embedding type lives in its own subpackage (e.g. `fuge.spectral`). Generic neural network components live in `fuge.nn` and accept pre-embedded tensors of any dimension, making them reusable across embedding types.
+**Modular embedding design:** Each embedding type lives in its own subpackage (e.g. `fuge.spectral`, `fuge.svd`). Generic neural network components live in `fuge.nn` and accept pre-embedded tensors of any dimension, making them reusable across embedding types. Import via explicit subpackage: `fuge.spectral.*`, `fuge.svd.*`, `fuge.nn.*`.
 
 **Token design:** Both frequency and phase are defined at half-window boundaries so they tile the signal without gaps. With 50% Hann window overlap, `f_end[w] ≈ f_start[w+1]` and `phase_end[w] ≈ phase_start[w+1]` for noiseless signals, enabling coherent tracking across windows. Center values can be recovered as `(start + end) / 2`.

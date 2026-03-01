@@ -1,10 +1,10 @@
-"""Fake EMRI (Extreme Mass Ratio Inspiral) gravitational wave signal generator.
+"""Multi-harmonic chirp signal generator.
 
 Auto-differentiable w.r.t. all continuous parameters via JAX.
 
 Parameters
 ----------
-f0 : initial GW frequency (Hz)
+f0 : initial frequency (Hz)
 chirp_mass : controls how fast the frequency sweeps up (arbitrary units)
 t_c : coalescence time (s); must be > T_obs
 A0 : overall amplitude scale
@@ -17,7 +17,7 @@ The waveform is built as:
 where phi(t) = 2*pi * cumulative_trapezoid(f(t)) and
 
     f(t) = f0 * (1 - t / t_c)^(-3/8 * chirp_mass)   (PN-inspired chirp)
-    A(t) = A0 * (1 - t / t_c)^(-1/4)                  (PN-inspired amplitude growth)
+    A(t) = A0 * (1 - t / t_c)^(-1/4)                  (amplitude growth)
 """
 
 import functools
@@ -27,7 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def emri_signal(
+def chirp_signal(
     f0: float,
     chirp_mass: float,
     t_c: float,
@@ -37,12 +37,12 @@ def emri_signal(
     N: int = 1_000_000,
     T_obs: float | None = None,
 ) -> np.ndarray:
-    """Generate a fake EMRI gravitational wave signal.
+    """Generate a multi-harmonic chirp signal.
 
     Parameters
     ----------
     f0 : float
-        Initial gravitational wave frequency (Hz).
+        Initial frequency (Hz).
     chirp_mass : float
         Chirp mass parameter controlling frequency evolution rate.
         Higher values produce faster chirps.  Units are arbitrary;
@@ -64,16 +64,16 @@ def emri_signal(
     Returns
     -------
     h : numpy.ndarray, shape (N,)
-        Time-domain gravitational wave strain.
+        Time-domain signal.
     """
     if T_obs is None:
         T_obs = 0.9 * t_c
-    h = _emri_impl(f0, chirp_mass, t_c, A0, harmonic_decay, n_harmonics, N, T_obs)
+    h = _chirp_impl(f0, chirp_mass, t_c, A0, harmonic_decay, n_harmonics, N, T_obs)
     return np.asarray(h)
 
 
 @functools.partial(jax.jit, static_argnums=(5, 6))
-def _emri_impl(f0, chirp_mass, t_c, A0, harmonic_decay, n_harmonics, N, T_obs):
+def _chirp_impl(f0, chirp_mass, t_c, A0, harmonic_decay, n_harmonics, N, T_obs):
     """JIT-compiled core.  n_harmonics and N are static (integers)."""
     t = jnp.linspace(0.0, T_obs, N)
     dt = T_obs / (N - 1)
@@ -89,8 +89,6 @@ def _emri_impl(f0, chirp_mass, t_c, A0, harmonic_decay, n_harmonics, N, T_obs):
     A_t = A0 * tau ** (-0.25)
 
     # --- Phase via trapezoidal cumulative integration ---
-    # phi(t_n) = 2*pi * sum_{i=0}^{n-1} (f[i] + f[i+1]) / 2 * dt
-    # O(dt^2) global error.
     trapezoids = (f_t[:-1] + f_t[1:]) * 0.5 * dt
     phase = jnp.concatenate([jnp.zeros(1), jnp.cumsum(trapezoids)])
     phase = 2.0 * jnp.pi * phase

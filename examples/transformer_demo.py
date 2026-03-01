@@ -1,4 +1,4 @@
-"""Transformer demo: predict EMRI parameters from spectral tokens."""
+"""Transformer demo: predict Chirp parameters from spectral tokens."""
 
 import time
 
@@ -14,7 +14,7 @@ jax.config.update("jax_enable_x64", True)
 
 from fuge.spectral import ToneTokenizer, ToneTokenEmbedding
 from fuge.nn import TransformerEmbedding
-from chirp import emri_signal
+from chirp import chirp_signal
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000
@@ -30,7 +30,7 @@ N_DLNF = 11
 DLNF_MIN = 0.0
 DLNF_MAX = 0.05
 
-# ── Fixed EMRI parameters ───────────────────────────────────────────
+# ── Fixed Chirp parameters ───────────────────────────────────────────
 T_C = 1e6
 A0 = 5.0
 N_HARMONICS = 4
@@ -67,7 +67,7 @@ N_EPOCHS = 60
 # =====================================================================
 
 def generate_dataset(n_signals, rng):
-    """Generate EMRI signals with random (f0, chirp_mass, harmonic_decay).
+    """Generate Chirp signals with random (f0, chirp_mass, harmonic_decay).
 
     Returns (signals, params) where signals is (n, N) and params is (n, 3).
     """
@@ -78,7 +78,7 @@ def generate_dataset(n_signals, rng):
     signals = np.zeros((n_signals, N))
 
     for i in range(n_signals):
-        signals[i] = emri_signal(
+        signals[i] = chirp_signal(
             f0=params[i, 0], chirp_mass=params[i, 1], t_c=T_C, A0=A0,
             harmonic_decay=params[i, 2], n_harmonics=N_HARMONICS, N=N,
         )
@@ -111,7 +111,7 @@ def tokenize_signals(signals, tokenizer, device):
 # Dataset
 # =====================================================================
 
-class EMRITokenDataset(Dataset):
+class ChirpTokenDataset(Dataset):
     def __init__(self, tokens, targets):
         self.tokens = tokens
         self.targets = targets
@@ -127,7 +127,7 @@ class EMRITokenDataset(Dataset):
 # Model: TransformerEmbedding backbone + task-specific head
 # =====================================================================
 
-class EMRIModel(nn.Module):
+class ChirpModel(nn.Module):
     """ToneTokenEmbedding + TransformerEmbedding backbone + regression head."""
 
     def __init__(self, token_emb, backbone, n_out, dropout=0.1):
@@ -265,7 +265,7 @@ if __name__ == "__main__":
     rng = np.random.default_rng(SEED)
 
     # 1. Generate signals
-    print(f"Generating {N_TRAIN + N_VAL} EMRI signals...")
+    print(f"Generating {N_TRAIN + N_VAL} Chirp signals...")
     t0 = time.time()
     all_signals, all_params = generate_dataset(N_TRAIN + N_VAL, rng)
     print(f"  Done in {time.time() - t0:.1f}s")
@@ -307,10 +307,10 @@ if __name__ == "__main__":
 
     # 5. Data loaders
     train_loader = DataLoader(
-        EMRITokenDataset(train_tokens, train_targets),
+        ChirpTokenDataset(train_tokens, train_targets),
         batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(
-        EMRITokenDataset(val_tokens, val_targets),
+        ChirpTokenDataset(val_tokens, val_targets),
         batch_size=BATCH_SIZE)
 
     # 6. Model: backbone + head
@@ -321,7 +321,7 @@ if __name__ == "__main__":
         d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS,
         d_ff=D_FF, dropout=DROPOUT,
     ).double().to(device)
-    model = EMRIModel(token_emb, backbone, n_out=N_PARAMS, dropout=DROPOUT
+    model = ChirpModel(token_emb, backbone, n_out=N_PARAMS, dropout=DROPOUT
                       ).double().to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
