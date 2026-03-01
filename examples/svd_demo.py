@@ -138,7 +138,7 @@ def figure_wiener():
 
     # --- Train PCA to convergence ---
     pca = PCAProjector(n_components=k, buffer_size=256, momentum=0.05,
-                       use_prior=True)
+                       shrinkage=True)
 
     for _ in range(n_train // 256 + 1):
         signal_coeffs = torch.randn(256, k, dtype=torch.float64) * torch.sqrt(eigenvalues_true)

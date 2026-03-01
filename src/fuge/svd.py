@@ -22,7 +22,7 @@ Example::
         proj.update(whiten(batch))
 
     # Inference: get stable k-dimensional coefficients
-    coeffs = proj.project(whiten(x))  # (batch_size, 32), ~unit variance
+    coeffs = proj(whiten(x))  # (batch_size, 32), ~unit variance
 """
 
 import torch
@@ -51,7 +51,7 @@ class PCAProjector(torch.nn.Module):
         3. c /= √λ                  (normalize to ~unit variance)
         4. c_out = c @ R.T          (rotate to stable frame)
 
-    reconstruct(X) → D-dim filtered signal (R cancels in round-trip).
+    reconstruct(X) → D-dim Wiener-filtered signal (R cancels in round-trip).
     """
 
     def __init__(
@@ -59,24 +59,21 @@ class PCAProjector(torch.nn.Module):
         n_components: int = 10,
         buffer_size: int = 256,
         momentum: float = 0.1,
-        normalize_output: bool = True,
-        use_prior: bool = True,
+        shrinkage: bool = True,
     ) -> None:
         """
         Args:
-            n_components: Number of principal components to retain.
+            n_components: Number of principal components to extract from the
+                          input data.
             buffer_size: Number of samples to accumulate before an SVD update.
             momentum: Blend factor α for merging new data with old covariance.
-            normalize_output: Whether to normalize D-dim reconstructions to unit
-                              average variance (only affects forward(), not project()).
-            use_prior: Whether to apply Wiener-filter shrinkage.
+            shrinkage: Whether to apply Wiener-filter shrinkage λ/(λ+1).
         """
         super().__init__()
         self.n_components: int = n_components
         self.buffer_size: int = buffer_size
         self.momentum: float = momentum
-        self.normalize_output: bool = normalize_output
-        self.use_prior: bool = use_prior
+        self.shrinkage: bool = shrinkage
 
         self.buffer: List[torch.Tensor] = []
         self.buffer_counter: int = 0
@@ -108,13 +105,12 @@ class PCAProjector(torch.nn.Module):
     def _procrustes(V_new, V_old):
         """Align V_new to V_old via orthogonal Procrustes. Both shape (k, D).
 
-        Returns (V_aligned, R) where V_aligned = R @ V_new and R is the
-        optimal k×k orthogonal rotation minimizing ||R @ V_new - V_old||_F.
+        Returns R, the optimal k×k orthogonal rotation minimizing
+        ||R @ V_new - V_old||_F.
         """
         C = V_old @ V_new.T  # (k, k)
         U, S, Wt = torch.linalg.svd(C)
-        R = U @ Wt
-        return R @ V_new, R
+        return U @ Wt
 
     def _compute_svd_update(self) -> None:
         """
@@ -158,7 +154,7 @@ class PCAProjector(torch.nn.Module):
 
             # Procrustes: align to previous stable frame (R_old @ V_old)
             V_stable_old = self._R @ self.components
-            _, R_new = self._procrustes(V_new, V_stable_old)
+            R_new = self._procrustes(V_new, V_stable_old)
 
             self.components = V_new
             self.eigenvalues = Λ_new
@@ -189,7 +185,7 @@ class PCAProjector(torch.nn.Module):
         # Project onto eigenbasis (diagonal covariance)
         coeffs = X @ self.components.T  # (batch_size, k)
 
-        if self.use_prior and self.eigenvalues is not None:
+        if self.shrinkage and self.eigenvalues is not None:
             # Wiener filter + normalize, diagonal in eigenbasis
             Λ = self.eigenvalues.clamp(min=1e-12)
             coeffs = coeffs * (Λ / (Λ + 1.0) / torch.sqrt(Λ)).unsqueeze(0)
@@ -202,7 +198,7 @@ class PCAProjector(torch.nn.Module):
 
     def reconstruct(self, X: torch.Tensor) -> torch.Tensor:
         """
-        Filter and reconstruct in original D-dimensional space.
+        Wiener-filter and reconstruct in original D-dimensional space.
 
         Wiener filter is diagonal in eigenbasis V. R is irrelevant here
         (cancels in the round-trip V.T @ diag(shrink) @ V).
@@ -220,15 +216,8 @@ class PCAProjector(torch.nn.Module):
 
         X_proj = X @ self.components.T  # (batch_size, k)
 
-        if self.use_prior:
+        if self.shrinkage:
             shrink = self.eigenvalues / (self.eigenvalues + 1.0)
             X_proj = X_proj * shrink.unsqueeze(0)
 
-        X_reconstructed = X_proj @ self.components
-
-        if self.normalize_output:
-            input_dim = X_reconstructed.shape[-1]
-            scale_factor = (self.eigenvalues.sum() / input_dim) ** 0.5
-            X_reconstructed = X_reconstructed / scale_factor
-
-        return X_reconstructed
+        return X_proj @ self.components
