@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from scipy.signal import spectrogram
 
-from fuge.emri import emri_signal, _emri_impl
+from chirp import emri_signal, _emri_impl
 
 if __name__ == "__main__":
     # Reasonable fake-EMRI parameters

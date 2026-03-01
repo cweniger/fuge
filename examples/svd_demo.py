@@ -17,7 +17,7 @@ Usage:
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from fuge.svd import PCAProjector
+from fuge.svd import StreamingPCA
 
 
 def generate_signals(theta, t):
@@ -45,7 +45,7 @@ def figure_procrustes():
     width_start = torch.tensor([2.0, 3.0, np.pi], dtype=torch.float64)
     width_end = torch.tensor([0.05, 0.05, 0.02], dtype=torch.float64)
 
-    pca = PCAProjector(n_components=k, buffer_size=buffer_size, momentum=0.15)
+    pca = StreamingPCA(n_components=k, buffer_size=buffer_size, momentum=0.15)
     history = []
 
     for r in range(n_rounds):
@@ -137,7 +137,7 @@ def figure_wiener():
     V_true = torch.linalg.qr(torch.randn(D, k, dtype=torch.float64))[0].T[:k]
 
     # --- Train PCA to convergence ---
-    pca = PCAProjector(n_components=k, buffer_size=256, momentum=0.05,
+    pca = StreamingPCA(n_components=k, buffer_size=256, momentum=0.05,
                        shrinkage=True)
 
     for _ in range(n_train // 256 + 1):

@@ -1,7 +1,7 @@
 """
 Streaming PCA via SVD with Procrustes-stabilized output.
 
-Provides `PCAProjector`, a streaming dimensionality reduction module that
+Provides `StreamingPCA`, a streaming dimensionality reduction module that
 maintains principal components and eigenvalues via momentum-blended SVD
 updates. Procrustes alignment ensures output coefficients have a stable
 meaning across updates — critical when feeding into a neural network.
@@ -15,7 +15,7 @@ assumes noise variance = 1.
 
 Example::
 
-    proj = PCAProjector(n_components=32, buffer_size=256, momentum=0.1)
+    proj = StreamingPCA(n_components=32, buffer_size=256, momentum=0.1)
 
     # Training: stream whitened batches through update()
     for batch in data_loader:
@@ -30,7 +30,7 @@ import numpy as np
 from typing import Optional, List
 
 
-class PCAProjector(torch.nn.Module):
+class StreamingPCA(torch.nn.Module):
     """
     Streaming PCA projector with Procrustes-stabilized output.
 

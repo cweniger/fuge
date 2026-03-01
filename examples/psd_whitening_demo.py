@@ -17,7 +17,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-from fuge import ToneTokenizer, ToneTokenEmbedding, TransformerEmbedding
+from fuge.spectral import ToneTokenizer, ToneTokenEmbedding
+from fuge.nn import TransformerEmbedding
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000

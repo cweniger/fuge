@@ -12,7 +12,9 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-from fuge import ToneTokenizer, ToneTokenEmbedding, TransformerEmbedding, emri_signal
+from fuge.spectral import ToneTokenizer, ToneTokenEmbedding
+from fuge.nn import TransformerEmbedding
+from chirp import emri_signal
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000
