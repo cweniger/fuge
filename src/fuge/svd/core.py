@@ -79,11 +79,25 @@ class StreamingPCA(torch.nn.Module):
         self.buffer_counter: int = 0
 
         # Eigenbasis: V and Λ match (V are eigenvectors, Λ eigenvalues)
-        self.components: Optional[torch.Tensor] = None    # (k, D)
-        self.eigenvalues: Optional[torch.Tensor] = None   # (k,)
+        # Registered as buffers so they persist through state_dict save/load.
+        # Empty tensors (numel==0) signal "not yet computed".
+        self.register_buffer("components", torch.empty(0))    # (k, D)
+        self.register_buffer("eigenvalues", torch.empty(0))   # (k,)
 
         # Procrustes rotation: eigenbasis → stable output frame
-        self._R: Optional[torch.Tensor] = None             # (k, k)
+        self.register_buffer("_R", torch.empty(0))             # (k, k)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys, error_msgs):
+        """Handle loading dynamically-sized buffers from state_dict."""
+        for name in ("components", "eigenvalues", "_R"):
+            key = prefix + name
+            if key in state_dict:
+                self._buffers[name] = torch.empty_like(state_dict[key])
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     def update(self, X: torch.Tensor) -> None:
         """
@@ -123,7 +137,7 @@ class StreamingPCA(torch.nn.Module):
         M = X.shape[0]
         alpha = self.momentum
 
-        if self.components is None:
+        if self.components.numel() == 0:
             # First update: dual PCA (M < D trick)
             K = X @ X.T / M  # (M, M)
             eigvals, eigvecs = torch.linalg.eigh(K)
@@ -177,7 +191,7 @@ class StreamingPCA(torch.nn.Module):
             Stable coefficients of shape (batch_size, k), ~unit variance
             for signal-dominated components.
         """
-        if self.components is None:
+        if self.components.numel() == 0:
             raise ValueError(
                 "SVD components not computed yet. Call update() enough times first."
             )
@@ -185,13 +199,13 @@ class StreamingPCA(torch.nn.Module):
         # Project onto eigenbasis (diagonal covariance)
         coeffs = X @ self.components.T  # (batch_size, k)
 
-        if self.shrinkage and self.eigenvalues is not None:
+        if self.shrinkage and self.eigenvalues.numel() > 0:
             # Wiener filter + normalize, diagonal in eigenbasis
             Λ = self.eigenvalues.clamp(min=1e-12)
             coeffs = coeffs * (Λ / (Λ + 1.0) / torch.sqrt(Λ)).unsqueeze(0)
 
         # Rotate to Procrustes-stable frame
-        if self._R is not None:
+        if self._R.numel() > 0:
             coeffs = coeffs @ self._R.T
 
         return coeffs
@@ -209,7 +223,7 @@ class StreamingPCA(torch.nn.Module):
         Returns:
             Reconstructed data of shape (batch_size, D).
         """
-        if self.components is None:
+        if self.components.numel() == 0:
             raise ValueError(
                 "SVD components not computed yet. Call update() enough times first."
             )
