@@ -2,6 +2,11 @@
 
 Transforms raw tone features (f_start, f_end, amp, phase_start,
 phase_end) into model-ready embedded features with z-score normalization.
+
+Input token format (from ToneTokenizer):
+  f_start, f_end: normalized frequency in [-1, 1]
+  amp: amplitude (positive, unbounded; log1p applied here)
+  phase_start, phase_end: wrapped to [-pi, pi]
 """
 
 import torch

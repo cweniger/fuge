@@ -378,9 +378,9 @@ class ToneTokenizer(nn.Module):
     ------
     forward(x) returns raw tokens of shape (B, N_WINDOWS, n_peaks, 5)
     with 5 values per peak: [f_start, f_end, amp, phase_start, phase_end].
-    f_start and f_end are fractional frequency bin indices at the half-window
-    boundaries (t = -0.5 and t = +0.5 in Hann window coords).  For adjacent
-    windows, f_end[w] ≈ f_start[w+1] for clean signals.
+    f_start and f_end are normalized to [-1, 1] (mapping from [0, Fk-1] where
+    Fk = k // 2 + 1).  phase_start and phase_end are wrapped to [-pi, pi].
+    For adjacent windows, f_end[w] ≈ f_start[w+1] for clean signals.
     When whitening is active, amp reflects SNR (amplitude / noise_std).
     """
 
@@ -466,9 +466,10 @@ class ToneTokenizer(nn.Module):
         Returns
         -------
         tokens : Tensor, shape (B, W, K, 5) or (W, K, 5)
-            Raw values per peak: [f_start, f_end, amp, phase_start, phase_end].
-            f_start/f_end are fractional frequency bin indices at half-window
-            boundaries.  W = number of time windows, K = n_peaks.
+            Values per peak: [f_start, f_end, amp, phase_start, phase_end].
+            f_start/f_end are normalized to [-1, 1].
+            phase_start/phase_end are wrapped to [-pi, pi].
+            W = number of time windows, K = n_peaks.
             When whitening is active, amp is SNR (amplitude / noise_std).
         """
         squeeze = x.dim() == 1
@@ -489,6 +490,15 @@ class ToneTokenizer(nn.Module):
         # boundaries are ±0.5 hops from center)
         f_start = freq * torch.exp(-dlnf / 2)
         f_end = freq * torch.exp(dlnf / 2)
+
+        # Normalize frequencies to [-1, 1] from [0, Fk-1]
+        Fk = self.decomposer.k // 2 + 1
+        f_start = 2.0 * f_start / (Fk - 1) - 1.0
+        f_end = 2.0 * f_end / (Fk - 1) - 1.0
+
+        # Wrap phases to [-pi, pi]
+        ps = (ps + torch.pi) % (2 * torch.pi) - torch.pi
+        pe = (pe + torch.pi) % (2 * torch.pi) - torch.pi
 
         tokens = torch.stack([f_start, f_end, amp, ps, pe], dim=-1)  # (B, W, K, 5)
 
