@@ -98,7 +98,7 @@ from fuge.svd import StreamingPCA
 
 pca = StreamingPCA(n_components=32, buffer_size=256, momentum=0.1)
 pca.update(whitened_batch)       # streaming update
-coeffs = pca(whitened_x)         # (B, D) -> (B, 32), stable ~unit variance
+coeffs = pca(whitened_x)         # (B, D) -> (B, 32), zeros before first update
 ```
 
 ### `fuge.nn.TransformerEmbedding` — Embedded tokens to fixed-size vector
