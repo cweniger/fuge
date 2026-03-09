@@ -28,7 +28,7 @@ embedded, n_windows, n_peaks = token_emb(tokens)  # (B, W*K, n_embed)
 
 # 3. Encode: embedded features -> fixed-size vector
 backbone = TransformerEmbedding(
-    d_in=token_emb.n_embed, seq_len=W * K, d_model=64,
+    seq_len=W * K, d_model=64,
 )
 embedding = backbone(embedded)  # (B, seq_len, d_in) -> (B, d_model)
 
@@ -98,7 +98,7 @@ from fuge.svd import StreamingPCA
 
 pca = StreamingPCA(n_components=32, buffer_size=256, momentum=0.1)
 pca.update(whitened_batch)       # streaming update
-coeffs = pca(whitened_x)         # (B, D) -> (B, 32), stable ~unit variance
+coeffs = pca(whitened_x)         # (B, D) -> (B, 32), zeros before first update
 ```
 
 ### `fuge.nn.TransformerEmbedding` — Embedded tokens to fixed-size vector

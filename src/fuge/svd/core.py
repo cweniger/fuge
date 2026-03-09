@@ -22,7 +22,7 @@ Example::
         proj.update(whiten(batch))
 
     # Inference: get stable k-dimensional coefficients
-    coeffs = proj(whiten(x))  # (batch_size, 32), ~unit variance
+    coeffs = proj(whiten(x))  # (batch_size, 32), zeros before first update
 """
 
 import torch
@@ -175,12 +175,12 @@ class StreamingPCA(torch.nn.Module):
 
         Returns:
             Stable coefficients of shape (batch_size, k), ~unit variance
-            for signal-dominated components.
+            for signal-dominated components. Before the first SVD update,
+            returns zeros with the correct shape.
         """
         if self.components is None:
-            raise ValueError(
-                "SVD components not computed yet. Call update() enough times first."
-            )
+            return torch.zeros(X.shape[0], self.n_components,
+                               dtype=X.dtype, device=X.device)
 
         # Project onto eigenbasis (diagonal covariance)
         coeffs = X @ self.components.T  # (batch_size, k)
