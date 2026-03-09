@@ -28,7 +28,7 @@ embedded, n_windows, n_peaks = token_emb(tokens)  # (B, W*K, n_embed)
 
 # 3. Encode: embedded features -> fixed-size vector
 backbone = TransformerEmbedding(
-    d_in=token_emb.n_embed, seq_len=W * K, d_model=64,
+    seq_len=W * K, d_model=64,
 )
 embedding = backbone(embedded)  # (B, seq_len, d_in) -> (B, d_model)
 

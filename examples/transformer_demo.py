@@ -317,7 +317,7 @@ if __name__ == "__main__":
     n_windows = train_tokens.shape[1]
     seq_len = n_windows * N_PEAKS
     backbone = TransformerEmbedding(
-        d_in=token_emb.n_embed, seq_len=seq_len,
+        seq_len=seq_len,
         d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS,
         d_ff=D_FF, dropout=DROPOUT,
     ).double().to(device)

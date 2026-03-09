@@ -15,8 +15,6 @@ class TransformerEmbedding(nn.Module):
 
     Parameters
     ----------
-    d_in : int
-        Input feature dimension per token.
     seq_len : int
         Total sequence length (e.g. n_windows * n_peaks).
     d_model : int
@@ -31,10 +29,10 @@ class TransformerEmbedding(nn.Module):
         Dropout rate.
     """
 
-    def __init__(self, d_in=None, seq_len=None, d_model=64,
+    def __init__(self, seq_len=None, d_model=64,
                  n_heads=4, n_layers=3, d_ff=256, dropout=0.1):
         super().__init__()
-        self.input_proj = nn.LazyLinear(d_model) if d_in is None else nn.Linear(d_in, d_model)
+        self.input_proj = nn.LazyLinear(d_model)
         self.d_model = d_model
 
         # Learnable positional encoding — created lazily on first forward
