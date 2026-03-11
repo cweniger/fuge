@@ -47,6 +47,25 @@ class DechirpSTFT(nn.Module):
         ])
         self.register_buffer("amp_unmix", torch.linalg.inv(M))
 
+        # Precompute scalloping correction lookup table for weighted windows.
+        # At fractional bin offset delta, the FFT magnitude is reduced by
+        # |DTFT(w, delta)| / |DTFT(w, 0)|.  We store the inverse of this
+        # ratio on a dense grid for fast interpolation at runtime.
+        # w_start and w_end have nearly identical scalloping (Hann symmetry),
+        # so we compute from w_start and use for both.
+        n_lut = 64  # half-bin resolution: 0 to 0.5
+        delta_lut = torch.linspace(0, 0.5, n_lut)
+        ns = torch.arange(k, dtype=torch.float64)
+        w_ref = self.window_start.double()
+        dtft_mag = torch.zeros(n_lut)
+        for i, d in enumerate(delta_lut):
+            phasor = torch.exp(2j * torch.pi * d * ns / k)
+            dtft_mag[i] = (w_ref * phasor).sum().abs()
+        # Normalize: correction = mag_at_0 / mag_at_delta
+        scallop_lut = dtft_mag[0] / dtft_mag.clamp(min=1e-12)
+        self.register_buffer("_scallop_lut", scallop_lut.float())
+        self.register_buffer("_scallop_delta_max", torch.tensor(0.5))
+
     def forward(self, x: torch.Tensor, a: float = 0.0, dlnf=0.0,
                 return_weighted: bool = False):
         """Compute the (de-chirped) windowed FFT.
@@ -394,14 +413,37 @@ class DechirpSTFT(nn.Module):
 
         return phase_start, phase_end
 
+    def _scallop_correction(self, delta: torch.Tensor) -> torch.Tensor:
+        """Look up scalloping correction factor from precomputed table.
+
+        Parameters
+        ----------
+        delta : Tensor
+            Fractional bin offset (signed); only |delta| matters.
+
+        Returns
+        -------
+        correction : Tensor, same shape as delta.
+            Multiply FFT magnitude at integer bin by this to recover
+            the on-bin magnitude.
+        """
+        lut = self._scallop_lut  # (n_lut,) on [0, 0.5]
+        n_lut = lut.shape[0]
+        # Map |delta| to LUT index space [0, n_lut-1]
+        t = delta.abs().clamp(max=0.5) * (n_lut - 1) / 0.5
+        idx_lo = t.long().clamp(max=n_lut - 2)
+        frac = t - idx_lo.float()
+        return lut[idx_lo] * (1 - frac) + lut[idx_lo + 1] * frac
+
     def peak_amplitudes(self, X_start: torch.Tensor, X_end: torch.Tensor,
-                        peaks: torch.Tensor,
+                        peaks: torch.Tensor, freq_refined: torch.Tensor,
                         ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract boundary amplitudes (A_start, A_end) from weighted FFTs.
 
         Uses the precomputed inverse mixing matrix to deconvolve the
         weighted FFT magnitudes into true boundary amplitudes, assuming
-        linear amplitude variation within each window.
+        linear amplitude variation within each window.  Corrects for
+        Hann-window scalloping loss at fractional frequency bin offsets.
 
         Parameters
         ----------
@@ -409,6 +451,9 @@ class DechirpSTFT(nn.Module):
             Weighted FFTs from forward(..., return_weighted=True).
         peaks : LongTensor, shape ([B,] N_WINDOWS, K, 2)
             Integer (dlnf_idx, freq_idx) from find_peaks.
+        freq_refined : Tensor, shape ([B,] N_WINDOWS, K)
+            Parabolic-interpolated fractional frequency bin index from
+            find_peaks, used to correct for scalloping loss.
 
         Returns
         -------
@@ -420,6 +465,7 @@ class DechirpSTFT(nn.Module):
             X_start = X_start.unsqueeze(1)
             X_end = X_end.unsqueeze(1)
             peaks = peaks.unsqueeze(0)
+            freq_refined = freq_refined.unsqueeze(0)
 
         D, B, W, k_full = X_start.shape
         Fk = self.k // 2 + 1
@@ -436,6 +482,12 @@ class DechirpSTFT(nn.Module):
         flat_idx = dlnf_idx * Fk + freq_idx  # (BW, K)
         mag_s = amp_s.gather(1, flat_idx)  # (BW, K)
         mag_e = amp_e.gather(1, flat_idx)  # (BW, K)
+
+        # Correct for scalloping loss at fractional bin offset
+        delta = freq_refined.reshape(B * W, K) - freq_idx.float()
+        scallop_corr = self._scallop_correction(delta)
+        mag_s = mag_s * scallop_corr
+        mag_e = mag_e * scallop_corr
 
         # Apply inverse mixing matrix: [A_start, A_end] = amp_unmix @ [mag_s, mag_e]
         M_inv = self.amp_unmix  # (2, 2)
@@ -602,7 +654,7 @@ class ToneTokenizer(nn.Module):
         ps, pe = self.decomposer.peak_phases(
             X, peaks, freq, dlnf, self.dlnf_grid)
         A_start, A_end = self.decomposer.peak_amplitudes(
-            X_start, X_end, peaks)
+            X_start, X_end, peaks, freq)
 
         # Time at half-window boundaries: sample k/4 and 3k/4 per window
         k = self.decomposer.k
