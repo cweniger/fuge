@@ -32,7 +32,23 @@ class DechirpSTFT(nn.Module):
         # Normalized time coordinate: t in [-1, +1] across the window
         self.register_buffer("t_norm", torch.linspace(-1.0, 1.0, k))
 
-    def forward(self, x: torch.Tensor, a: float = 0.0, dlnf=0.0) -> torch.Tensor:
+        # Weighted windows for amplitude-at-boundary estimation
+        t_unit = torch.linspace(0, 1, k)
+        window = torch.hann_window(k)
+        self.register_buffer("window_start", (1 - t_unit) * window)
+        self.register_buffer("window_end", t_unit * window)
+
+        # Precompute 2x2 mixing matrix and its inverse
+        basis_start = 1 - t_unit
+        basis_end = t_unit
+        M = torch.tensor([
+            [(self.window_start * basis_start).sum(), (self.window_start * basis_end).sum()],
+            [(self.window_end * basis_start).sum(), (self.window_end * basis_end).sum()],
+        ])
+        self.register_buffer("amp_unmix", torch.linalg.inv(M))
+
+    def forward(self, x: torch.Tensor, a: float = 0.0, dlnf=0.0,
+                return_weighted: bool = False):
         """Compute the (de-chirped) windowed FFT.
 
         Parameters
@@ -48,12 +64,17 @@ class DechirpSTFT(nn.Module):
             If a 1-D Tensor, computes the STFT for each value in parallel;
             output gains a leading D dimension.
             dlnf = 0 disables.
+        return_weighted : bool
+            If True, also return weighted FFTs for amplitude boundary
+            estimation.  Returns (X, X_start, X_end).
 
         Returns
         -------
         X : complex Tensor
             Scalar dlnf: shape (N_WINDOWS, k) or (B, N_WINDOWS, k).
             Batched dlnf: shape (D, N_WINDOWS, k) or (D, B, N_WINDOWS, k).
+        X_start, X_end : complex Tensor (only if return_weighted=True)
+            Same shape as X, from (1-t)*hann and t*hann weighted windows.
         """
         squeeze = x.dim() == 1
         if squeeze:
@@ -65,24 +86,47 @@ class DechirpSTFT(nn.Module):
         # Apply Hann window
         windowed = windows * self.window
 
+        # Weighted windows for amplitude boundary estimation
+        if return_weighted:
+            windowed_start = windows * self.window_start
+            windowed_end = windows * self.window_end
+
         # --- Relative de-chirp via time-grid resampling ---
         # dlnf is per hop; full window spans 2 hops
         batched = isinstance(dlnf, torch.Tensor) and dlnf.dim() >= 1
         if batched:
             windowed = self._resample_dechirp_batched(windowed, 2.0 * dlnf)
-            # (D, B, N_WINDOWS, k)
+            if return_weighted:
+                windowed_start = self._resample_dechirp_batched(windowed_start, 2.0 * dlnf)
+                windowed_end = self._resample_dechirp_batched(windowed_end, 2.0 * dlnf)
         elif dlnf != 0.0:
             windowed = self._resample_dechirp(windowed, 2.0 * dlnf)
+            if return_weighted:
+                windowed_start = self._resample_dechirp(windowed_start, 2.0 * dlnf)
+                windowed_end = self._resample_dechirp(windowed_end, 2.0 * dlnf)
 
         # --- Absolute de-chirp via phase multiplication ---
         if a != 0.0:
             chirp_kernel = torch.exp(-1j * a * self.t_norm ** 2)
             windowed = windowed * chirp_kernel
+            if return_weighted:
+                windowed_start = windowed_start * chirp_kernel
+                windowed_end = windowed_end * chirp_kernel
 
         X = torch.fft.fft(windowed, n=self.k, dim=-1)
 
+        if return_weighted:
+            X_start = torch.fft.fft(windowed_start, n=self.k, dim=-1)
+            X_end = torch.fft.fft(windowed_end, n=self.k, dim=-1)
+
         if squeeze:
             X = X.squeeze(1) if batched else X.squeeze(0)
+            if return_weighted:
+                X_start = X_start.squeeze(1) if batched else X_start.squeeze(0)
+                X_end = X_end.squeeze(1) if batched else X_end.squeeze(0)
+
+        if return_weighted:
+            return X, X_start, X_end
         return X
 
     def _resample_dechirp(self, windowed: torch.Tensor, beta: float) -> torch.Tensor:
@@ -350,6 +394,63 @@ class DechirpSTFT(nn.Module):
 
         return phase_start, phase_end
 
+    def peak_amplitudes(self, X_start: torch.Tensor, X_end: torch.Tensor,
+                        peaks: torch.Tensor,
+                        ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract boundary amplitudes (A_start, A_end) from weighted FFTs.
+
+        Uses the precomputed inverse mixing matrix to deconvolve the
+        weighted FFT magnitudes into true boundary amplitudes, assuming
+        linear amplitude variation within each window.
+
+        Parameters
+        ----------
+        X_start, X_end : complex Tensor, shape (D, N_WINDOWS, k) or (D, B, N_WINDOWS, k)
+            Weighted FFTs from forward(..., return_weighted=True).
+        peaks : LongTensor, shape ([B,] N_WINDOWS, K, 2)
+            Integer (dlnf_idx, freq_idx) from find_peaks.
+
+        Returns
+        -------
+        A_start, A_end : Tensor, shape ([B,] N_WINDOWS, K)
+            Amplitude at window start and end boundaries, clamped >= 0.
+        """
+        batched = X_start.dim() == 4
+        if not batched:
+            X_start = X_start.unsqueeze(1)
+            X_end = X_end.unsqueeze(1)
+            peaks = peaks.unsqueeze(0)
+
+        D, B, W, k_full = X_start.shape
+        Fk = self.k // 2 + 1
+        K = peaks.shape[2]
+
+        # Flatten batch*window for gathering
+        dlnf_idx = peaks.reshape(B * W, K, 2)[:, :, 0]
+        freq_idx = peaks.reshape(B * W, K, 2)[:, :, 1]
+
+        # Rearrange: (D, B, W, k) -> (B, W, D, Fk) -> (BW, D*Fk)
+        amp_s = X_start[..., :Fk].abs().permute(1, 2, 0, 3).reshape(B * W, D * Fk)
+        amp_e = X_end[..., :Fk].abs().permute(1, 2, 0, 3).reshape(B * W, D * Fk)
+
+        flat_idx = dlnf_idx * Fk + freq_idx  # (BW, K)
+        mag_s = amp_s.gather(1, flat_idx)  # (BW, K)
+        mag_e = amp_e.gather(1, flat_idx)  # (BW, K)
+
+        # Apply inverse mixing matrix: [A_start, A_end] = amp_unmix @ [mag_s, mag_e]
+        M_inv = self.amp_unmix  # (2, 2)
+        A_start = M_inv[0, 0] * mag_s + M_inv[0, 1] * mag_e
+        A_end = M_inv[1, 0] * mag_s + M_inv[1, 1] * mag_e
+
+        A_start = A_start.clamp(min=0.0).reshape(B, W, K)
+        A_end = A_end.clamp(min=0.0).reshape(B, W, K)
+
+        if not batched:
+            A_start = A_start.squeeze(0)
+            A_end = A_end.squeeze(0)
+
+        return A_start, A_end
+
 
 class ToneTokenizer(nn.Module):
     """Tokenize time-domain signals into spectral peak features.
@@ -376,12 +477,19 @@ class ToneTokenizer(nn.Module):
 
     Output
     ------
-    forward(x) returns raw tokens of shape (B, N_WINDOWS, n_peaks, 5)
-    with 5 values per peak: [f_start, f_end, amp, phase_start, phase_end].
+    forward(x) returns raw tokens of shape (B, N_WINDOWS, n_peaks, 9)
+    with 9 values per peak: [snr, t_start, t_end, f_start, f_end, A_start,
+    A_end, phase_start, phase_end].
+    snr is the peak amplitude from the (optionally whitened) STFT — when
+    whitening is active this is a true signal-to-noise ratio.
+    t_start and t_end are sample positions at half-window boundaries (k/4 and
+    3k/4), normalized to [-1, 1] over the signal length.  For adjacent windows,
+    t_end[w] = t_start[w+1].
     f_start and f_end are normalized to [-1, 1] (mapping from [0, Fk-1] where
-    Fk = k // 2 + 1).  phase_start and phase_end are wrapped to [-pi, pi].
-    For adjacent windows, f_end[w] ≈ f_start[w+1] for clean signals.
-    When whitening is active, amp reflects SNR (amplitude / noise_std).
+    Fk = k // 2 + 1).  A_start and A_end are boundary amplitudes recovered
+    via weighted FFTs and mixing matrix inversion.  phase_start and phase_end
+    are wrapped to [-pi, pi].  For adjacent windows, f_end[w] ≈ f_start[w+1]
+    for clean signals.
     """
 
     def __init__(self, k: int = 1024, n_peaks: int = 3, radius: int = 2,
@@ -402,8 +510,8 @@ class ToneTokenizer(nn.Module):
 
     @property
     def n_raw(self):
-        """Number of raw features per peak token (always 5)."""
-        return 5
+        """Number of raw features per peak token (always 9)."""
+        return 9
 
     @torch.no_grad()
     def update_noise_std(self, x: torch.Tensor, momentum: float = 0.99) -> None:
@@ -465,26 +573,51 @@ class ToneTokenizer(nn.Module):
 
         Returns
         -------
-        tokens : Tensor, shape (B, W, K, 5) or (W, K, 5)
-            Values per peak: [f_start, f_end, amp, phase_start, phase_end].
+        tokens : Tensor, shape (B, W, K, 9) or (W, K, 9)
+            Values per peak: [snr, t_start, t_end, f_start, f_end, A_start,
+            A_end, phase_start, phase_end].
+            snr is peak amplitude (SNR when whitened).
+            t_start/t_end are normalized to [-1, 1] over signal length.
             f_start/f_end are normalized to [-1, 1].
+            A_start/A_end are boundary amplitudes.
             phase_start/phase_end are wrapped to [-pi, pi].
             W = number of time windows, K = n_peaks.
-            When whitening is active, amp is SNR (amplitude / noise_std).
         """
         squeeze = x.dim() == 1
         if squeeze:
             x = x.unsqueeze(0)
 
-        X = self.decomposer(x, dlnf=self.dlnf_grid)  # (D, B, W, k)
+        B, N = x.shape
+
+        X, X_start, X_end = self.decomposer(
+            x, dlnf=self.dlnf_grid, return_weighted=True)  # (D, B, W, k)
 
         if self.noise_std is not None:
             X = self._whiten(X)
+            X_start = self._whiten(X_start)
+            X_end = self._whiten(X_end)
 
-        peaks, freq, dlnf, amp = self.decomposer.find_peaks(
+        peaks, freq, dlnf, snr = self.decomposer.find_peaks(
             X, K=self.n_peaks, dlnf_grid=self.dlnf_grid, radius=self.radius)
         ps, pe = self.decomposer.peak_phases(
             X, peaks, freq, dlnf, self.dlnf_grid)
+        A_start, A_end = self.decomposer.peak_amplitudes(
+            X_start, X_end, peaks)
+
+        # Time at half-window boundaries: sample k/4 and 3k/4 per window
+        k = self.decomposer.k
+        hop = self.decomposer.hop
+        W = peaks.shape[-3]
+        w_idx = torch.arange(W, device=x.device, dtype=x.dtype)
+        # Absolute sample positions of boundaries
+        t_s = w_idx * hop + k // 4       # (W,)
+        t_e = w_idx * hop + 3 * k // 4   # (W,)
+        # Normalize to [-1, 1] over signal length
+        t_s = 2.0 * t_s / (N - 1) - 1.0
+        t_e = 2.0 * t_e / (N - 1) - 1.0
+        # Broadcast to match peak dims: (W,) -> (W, 1) -> matches (B, W, K)
+        t_start = t_s.unsqueeze(-1).expand_as(freq)
+        t_end = t_e.unsqueeze(-1).expand_as(freq)
 
         # Frequency at half-window boundaries (dlnf is per hop,
         # boundaries are ±0.5 hops from center)
@@ -500,7 +633,8 @@ class ToneTokenizer(nn.Module):
         ps = (ps + torch.pi) % (2 * torch.pi) - torch.pi
         pe = (pe + torch.pi) % (2 * torch.pi) - torch.pi
 
-        tokens = torch.stack([f_start, f_end, amp, ps, pe], dim=-1)  # (B, W, K, 5)
+        tokens = torch.stack(
+            [snr, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe], dim=-1)
 
         if squeeze:
             tokens = tokens.squeeze(0)

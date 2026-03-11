@@ -50,7 +50,7 @@ The `dlnf` parameter is per-hop and internally scaled by 2 for the full window. 
 
 ### `src/fuge/spectral/embedding.py` — `ToneTokenEmbedding(nn.Module)`
 
-Transforms raw tone tokens (f_start, f_end, amp, phase_start, phase_end) into model-ready embedded features with z-score normalization.
+Transforms raw tone tokens (snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end) into model-ready embedded features with z-score normalization. SNR is peak amplitude from the (optionally whitened) STFT. Time and frequency boundaries tile the signal; boundary amplitudes are recovered via weighted FFTs with complementary time weights.
 
 ### `src/fuge/svd/core.py` — `StreamingPCA(nn.Module)`
 
