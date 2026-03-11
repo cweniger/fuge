@@ -38,7 +38,9 @@ class DechirpSTFT(nn.Module):
         self.register_buffer("window_start", (1 - t_unit) * window)
         self.register_buffer("window_end", t_unit * window)
 
-        # Precompute 2x2 mixing matrix and its inverse
+        # Precompute 2x2 mixing matrix and its inverse.
+        # The mixing matrix relates weighted FFT magnitudes to boundary
+        # amplitudes, assuming linear A(t) within the window.
         basis_start = 1 - t_unit
         basis_end = t_unit
         M = torch.tensor([
@@ -54,17 +56,15 @@ class DechirpSTFT(nn.Module):
         # w_start and w_end have nearly identical scalloping (Hann symmetry),
         # so we compute from w_start and use for both.
         n_lut = 64  # half-bin resolution: 0 to 0.5
-        delta_lut = torch.linspace(0, 0.5, n_lut)
         ns = torch.arange(k, dtype=torch.float64)
+        delta_lut = torch.linspace(0, 0.5, n_lut)
         w_ref = self.window_start.double()
         dtft_mag = torch.zeros(n_lut)
         for i, d in enumerate(delta_lut):
             phasor = torch.exp(2j * torch.pi * d * ns / k)
             dtft_mag[i] = (w_ref * phasor).sum().abs()
-        # Normalize: correction = mag_at_0 / mag_at_delta
         scallop_lut = dtft_mag[0] / dtft_mag.clamp(min=1e-12)
         self.register_buffer("_scallop_lut", scallop_lut.float())
-        self.register_buffer("_scallop_delta_max", torch.tensor(0.5))
 
         # Precompute parabolic interpolation correction LUT.
         # Parabolic interpolation on Hann-windowed data systematically
@@ -499,6 +499,10 @@ class DechirpSTFT(nn.Module):
         linear amplitude variation within each window.  Corrects for
         Hann-window scalloping loss at fractional frequency bin offsets.
 
+        The output amplitudes are true time-domain amplitudes (the 1/2
+        factor from the cosine→complex exponential decomposition in the
+        FFT is corrected for).
+
         Parameters
         ----------
         X_start, X_end : complex Tensor, shape (D, N_WINDOWS, k) or (D, B, N_WINDOWS, k)
@@ -544,9 +548,11 @@ class DechirpSTFT(nn.Module):
         mag_e = mag_e * scallop_corr
 
         # Apply inverse mixing matrix: [A_start, A_end] = amp_unmix @ [mag_s, mag_e]
+        # Then multiply by 2 to correct for the cosine→complex exponential
+        # factor of 1/2 in the FFT magnitudes.
         M_inv = self.amp_unmix  # (2, 2)
-        A_start = M_inv[0, 0] * mag_s + M_inv[0, 1] * mag_e
-        A_end = M_inv[1, 0] * mag_s + M_inv[1, 1] * mag_e
+        A_start = 2.0 * (M_inv[0, 0] * mag_s + M_inv[0, 1] * mag_e)
+        A_end = 2.0 * (M_inv[1, 0] * mag_s + M_inv[1, 1] * mag_e)
 
         A_start = A_start.clamp(min=0.0).reshape(B, W, K)
         A_end = A_end.clamp(min=0.0).reshape(B, W, K)

@@ -92,11 +92,8 @@ def reconstruct_from_tokens(tokens, k, N_signal):
             f_start_bin = (tokens[w, p, 3] + 1.0) / 2.0 * (Fk - 1)
             f_end_bin = (tokens[w, p, 4] + 1.0) / 2.0 * (Fk - 1)
 
-            # Factor of 2: FFT of w(n)*A*cos(...) gives |X| = A*sum(w)/2
-            # but the mixing matrix uses sum(w*basis) without the 1/2,
-            # so recovered amplitudes are half the true time-domain value.
-            A_s = tokens[w, p, 5] * 2.0
-            A_e = tokens[w, p, 6] * 2.0
+            A_s = tokens[w, p, 5]
+            A_e = tokens[w, p, 6]
             ps = tokens[w, p, 7]
             pe = tokens[w, p, 8]
 
