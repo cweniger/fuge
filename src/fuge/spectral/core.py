@@ -66,6 +66,33 @@ class DechirpSTFT(nn.Module):
         self.register_buffer("_scallop_lut", scallop_lut.float())
         self.register_buffer("_scallop_delta_max", torch.tensor(0.5))
 
+        # Precompute parabolic interpolation correction LUT.
+        # Parabolic interpolation on Hann-windowed data systematically
+        # underestimates fractional bin offsets (e.g. true 0.4 -> estimated 0.36).
+        # We precompute the exact forward mapping true_delta -> para_delta using
+        # the known Hann DTFT, then store the inverse for runtime correction.
+        n_corr = 1000  # dense forward mapping
+        true_d = torch.linspace(0, 0.5, n_corr, dtype=torch.float64)
+        para_d = torch.zeros(n_corr, dtype=torch.float64)
+        w_hann = self.window.double()
+        for i, td in enumerate(true_d):
+            mags = []
+            for off in [-1, 0, 1]:
+                phasor = torch.exp(2j * torch.pi * (off - td) * ns / k)
+                mags.append((w_hann * phasor).sum().abs())
+            ym, y0, yp = mags
+            denom = ym - 2.0 * y0 + yp
+            para_d[i] = 0.5 * (ym - yp) / denom if denom.abs() > 1e-12 else 0.0
+        # Invert: uniform grid over parabolic delta -> true delta
+        n_inv = 64
+        para_grid = torch.linspace(0, 0.5, n_inv, dtype=torch.float64)
+        # numpy interp for inversion (monotonic)
+        import numpy as _np
+        true_inv = _np.interp(
+            para_grid.numpy(), para_d.numpy(), true_d.numpy())
+        self.register_buffer(
+            "_para_corr_lut", torch.from_numpy(true_inv).float())
+
     def forward(self, x: torch.Tensor, a: float = 0.0, dlnf=0.0,
                 return_weighted: bool = False):
         """Compute the (de-chirped) windowed FFT.
@@ -308,6 +335,7 @@ class DechirpSTFT(nn.Module):
         f_delta = 0.5 * (yf_m - yf_p) / f_denom
         f_delta = torch.where(f_denom.abs() < 1e-12, torch.zeros_like(f_delta), f_delta)
         f_delta = f_delta.clamp(-0.5, 0.5)
+        f_delta = self._correct_parabolic(f_delta)
         freq_refined = fi.float() + f_delta
 
         # --- Parabolic interpolation along dlnf axis ---
@@ -412,6 +440,32 @@ class DechirpSTFT(nn.Module):
             phase_end = phase_end.squeeze(0)
 
         return phase_start, phase_end
+
+    def _correct_parabolic(self, delta: torch.Tensor) -> torch.Tensor:
+        """Correct parabolic interpolation bias using precomputed LUT.
+
+        Parabolic interpolation systematically underestimates fractional
+        bin offsets for Hann windows.  This method maps the biased estimate
+        to the true offset using an exact inverse mapping.
+
+        Parameters
+        ----------
+        delta : Tensor
+            Signed parabolic estimate of fractional bin offset.
+
+        Returns
+        -------
+        corrected : Tensor, same shape as delta.
+        """
+        lut = self._para_corr_lut  # (n_inv,) on [0, 0.5]
+        n_inv = lut.shape[0]
+        sign = delta.sign()
+        ad = delta.abs().clamp(max=0.5)
+        t = ad * (n_inv - 1) / 0.5
+        idx_lo = t.long().clamp(max=n_inv - 2)
+        frac = t - idx_lo.float()
+        corrected = lut[idx_lo] * (1 - frac) + lut[idx_lo + 1] * frac
+        return sign * corrected
 
     def _scallop_correction(self, delta: torch.Tensor) -> torch.Tensor:
         """Look up scalloping correction factor from precomputed table.
