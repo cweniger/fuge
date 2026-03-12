@@ -4,8 +4,9 @@ Generates a chirp signal, tokenizes it, reconstructs the signal from
 tokens alone using overlap-add synthesis, and compares with the original.
 
 Reconstruction per window per peak:
-  1. Linearly interpolate phase from phase_start (at sample k/4)
-     to phase_end (at sample 3k/4), extrapolate to window edges.
+  1. Quadratically interpolate phase from phase_start (at sample k/4)
+     to phase_end (at sample 3k/4), using f_start/f_end to account
+     for frequency chirp within the window.
   2. Linearly interpolate amplitude from A_start to A_end similarly.
   3. Synthesize: s(n) = A(n) * cos(phi(n))
   4. Apply Hann window, overlap-add.
@@ -30,15 +31,15 @@ CHIRP_MASS = 5.0
 T_C = 1e6
 A0 = 5.0
 HARMONIC_DECAY = 1.5
-N_HARMONICS = 1
+N_HARMONICS = 4
 NOISE_SIGMA = 0.0  # noiseless for clean reconstruction test
 
 # ── Tokenizer parameters ─────────────────────────────────────────────
 K_WINDOW = 1024
-N_PEAKS = 4
-N_DLNF = 11
+N_PEAKS = 5
+N_DLNF = 101
 DLNF_MIN = 0.0
-DLNF_MAX = 0.05
+DLNF_MAX = 0.5
 
 SEED = 42
 
@@ -111,8 +112,13 @@ def reconstruct_from_tokens(tokens, k, N_signal):
             n_wraps = np.round((expected_dphi - dphi) / (2 * np.pi))
             dphi_unwrapped = dphi + n_wraps * 2 * np.pi
 
-            # Linear phase interpolation
-            phi_n = ps + dphi_unwrapped * frac  # (k,)
+            # Quadratic phase interpolation: accounts for frequency
+            # change within the window.  The correction term is zero at
+            # the boundary anchors (frac=0 and frac=1) and maximal at
+            # the window center (frac=0.5).
+            df = f_end_bin - f_start_bin
+            phi_n = (ps + dphi_unwrapped * frac
+                     + (np.pi / 2) * df * frac * (frac - 1))  # (k,)
 
             window_signal += A_n * np.cos(phi_n)
 
@@ -202,8 +208,10 @@ def main():
 
     # Zoomed comparison — late (harder region)
     ax = axes[0, 1]
-    z2_start = int(0.85 * N)
-    z2 = slice(z2_start, z2_start + 6 * K_WINDOW)
+    z2_start = int(0.95 * N)
+    #z2 = slice(z2_start, z2_start + 6 * K_WINDOW)
+    #z2 = slice(z2_start, z2_start + 1 * K_WINDOW)
+    z2 = slice(z2_start, z2_start + 200)
     ax.plot(t[z2], signal_clean[z2], 'b-', lw=0.8, alpha=0.8, label='Original')
     ax.plot(t[z2], recon[z2], 'r--', lw=0.8, alpha=0.8, label='Reconstructed')
     ax.set_xlabel("Sample")

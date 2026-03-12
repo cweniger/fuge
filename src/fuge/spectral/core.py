@@ -437,12 +437,35 @@ class DechirpSTFT(nn.Module):
         f_delta = freq_ref - freq_idx.float()
         phi_0 = X_peak.angle() - torch.pi * f_delta * (self.k - 1) / self.k
 
-        # Advance to half-window boundaries using freq_refined (bin units).
-        # phase(n) = phi_0 + 2*pi * freq * n / k
-        # phase_start at n = k/4:  phi_0 + pi * freq / 2
-        # phase_end   at n = 3k/4: phi_0 + 3 * pi * freq / 2
-        phase_start = (phi_0 + torch.pi * freq_ref / 2).reshape(B, W, K)
-        phase_end = (phi_0 + 3 * torch.pi * freq_ref / 2).reshape(B, W, K)
+        # Advance to half-window boundaries via the dechirp warping.
+        #
+        # phi_0 is the phase at sample 0, extracted from the dechirped FFT.
+        # In the dechirped domain, the signal is a pure tone at freq_ref,
+        # so the phase at dechirped position tau in [0, 1] is:
+        #   phi_dechirp(tau) = phi_0 + 2*pi * freq_ref * tau
+        #
+        # The dechirp resampling maps original sample position n to
+        # dechirped position:
+        #   tau(n) = (exp(beta * n/k) - 1) / (exp(beta) - 1)
+        # where beta = 2 * dlnf_applied (the grid value used for dechirping).
+        #
+        # For beta -> 0 this reduces to tau = n/k (identity), giving the
+        # linear formula phi_0 + 2*pi*freq*n/k.
+        dlnf_applied = dlnf_grid[dlnf_idx]  # (BW, K) — the actual dechirp used
+        beta = 2.0 * dlnf_applied
+        small = beta.abs() < 1e-8
+        beta_safe = torch.where(small, torch.ones_like(beta), beta)
+        eb = torch.exp(beta_safe)
+
+        def _phase_at(n_frac):
+            """Phase at original sample n_frac * k, via dechirp mapping."""
+            tau = (torch.exp(beta_safe * n_frac) - 1.0) / (eb - 1.0)
+            warped_adv = 2.0 * torch.pi * freq_ref * tau
+            linear_adv = 2.0 * torch.pi * freq_ref * n_frac
+            return torch.where(small, linear_adv, warped_adv)
+
+        phase_start = (phi_0 + _phase_at(0.25)).reshape(B, W, K)
+        phase_end = (phi_0 + _phase_at(0.75)).reshape(B, W, K)
 
         if not batched:
             phase_start = phase_start.squeeze(0)
