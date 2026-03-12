@@ -209,14 +209,12 @@ def main():
     # Zoomed comparison — late (harder region)
     ax = axes[0, 1]
     z2_start = int(0.95 * N)
-    #z2 = slice(z2_start, z2_start + 6 * K_WINDOW)
-    #z2 = slice(z2_start, z2_start + 1 * K_WINDOW)
-    z2 = slice(z2_start, z2_start + 200)
+    z2 = slice(z2_start, z2_start + 6 * K_WINDOW)
     ax.plot(t[z2], signal_clean[z2], 'b-', lw=0.8, alpha=0.8, label='Original')
     ax.plot(t[z2], recon[z2], 'r--', lw=0.8, alpha=0.8, label='Reconstructed')
     ax.set_xlabel("Sample")
     ax.set_ylabel("Amplitude")
-    ax.set_title("Late region (6 windows at t=85%)")
+    ax.set_title("Late region (6 windows at t=95%)")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
