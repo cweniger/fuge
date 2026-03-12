@@ -21,19 +21,19 @@ N = 10_000
 T_C_FRAC = 0.75          # coalescence at 3/4 of signal
 T_C = int(T_C_FRAC * N)  # sample index of coalescence
 
-F0 = 0.002               # initial frequency (cycles/sample)
+F0 = 0.001               # initial frequency (cycles/sample)
 F_RD = 0.01              # ringdown frequency (cycles/sample)
 CHIRP_RATE = (F_RD - F0) / T_C  # constant df/dt
 
-A0 = 0.2                 # amplitude scale
-AMP_EXPONENT = -0.80     # power-law index for inspiral amplitude
+A0 = 0.1                 # amplitude scale
+AMP_EXPONENT = -1.00     # power-law index for inspiral amplitude
 A_PEAK = 10.0             # peak amplitude at coalescence
 
 TAU_RD = 120.0           # ringdown e-folding time (samples)
 # ~50 oscillations in ringdown: 5*tau_rd * f_rd = 5*500*0.02 = 50
 
 # ── Tokenizer parameters ─────────────────────────────────────────────
-K_WINDOW = 512
+K_WINDOW = 256
 N_PEAKS = 1
 N_DLNF = 51
 DLNF_MIN = 0.0
@@ -158,6 +158,10 @@ def main():
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double()
 
+    # Get the dlnf=0 STFT (same as what goes into peak search)
+    X0 = tokenizer.decomposer(x, dlnf=0.0)  # (1, W, k)
+    stft_mag = X0[0, :, :K_WINDOW // 2 + 1].abs().numpy()  # (W, Fk)
+
     tokens = tokenizer(x)  # (1, W, K, 9)
     tokens = tokens[0].numpy()  # (W, K, 9)
     W, K, _ = tokens.shape
@@ -210,14 +214,19 @@ def main():
     ax_bl.legend(fontsize=8)
     ax_bl.grid(True, alpha=0.3)
 
-    # Bottom right: residual spectrogram
+    # Bottom right: tokenizer STFT at dlnf=0
     ax_br = fig.add_subplot(gs[1, 1])
-    ax_br.specgram(residual, NFFT=K_WINDOW, Fs=1.0, noverlap=K_WINDOW // 2,
-                   cmap='magma', scale='dB')
+    hop = K_WINDOW // 2
+    Fk = K_WINDOW // 2 + 1
+    t_wins = np.arange(stft_mag.shape[0]) * hop + K_WINDOW / 2  # window centers
+    f_bins = np.arange(Fk) / K_WINDOW  # cycles/sample
+    ax_br.pcolormesh(t_wins, f_bins, 20 * np.log10(stft_mag.T + 1e-12),
+                     cmap='magma', shading='nearest')
     ax_br.axvline(T_C, color='w', ls=':', lw=1, alpha=0.7)
+    ax_br.set_ylim(0, 5 * F_RD)
     ax_br.set_xlabel("Sample")
     ax_br.set_ylabel("Frequency (cycles/sample)")
-    ax_br.set_title("Residual spectrogram")
+    ax_br.set_title("DechirpSTFT magnitude (dlnf=0)")
 
     out = "merger_reconstruction_demo.png"
     plt.savefig(out, dpi=150)
