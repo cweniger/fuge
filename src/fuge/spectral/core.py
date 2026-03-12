@@ -309,6 +309,15 @@ class DechirpSTFT(nn.Module):
         pooled = F.max_pool2d(amp_4d, kernel_size=kernel, stride=1, padding=radius)
         is_peak = (amp_4d == pooled).squeeze(1)  # (BW, D, F)
 
+        # Collapse duplicate peaks along the dlnf axis: for each frequency
+        # bin, keep only the dlnf index with the highest amplitude.  This
+        # prevents a slowly-chirping signal (flat dlnf response) from
+        # producing multiple peaks at the same frequency.
+        best_d = amp.argmax(dim=1, keepdim=True)  # (BW, 1, Fk)
+        dlnf_mask = torch.zeros_like(is_peak)
+        dlnf_mask.scatter_(1, best_d, 1)
+        is_peak = is_peak & dlnf_mask.bool()
+
         # Keep only peak amplitudes, flatten spatial dims
         amp_peaks = torch.where(is_peak, amp, torch.zeros_like(amp))
         amp_flat = amp_peaks.reshape(BW, -1)  # (BW, D*F)

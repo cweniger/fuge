@@ -25,12 +25,12 @@ from fuge.spectral import ToneTokenizer
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000
-F0 = 2.75e-3
-CHIRP_MASS = 1.0
+F0 = 2.75e-4
+CHIRP_MASS = 5.0
 T_C = 1e6
 A0 = 5.0
 HARMONIC_DECAY = 1.5
-N_HARMONICS = 4
+N_HARMONICS = 1
 NOISE_SIGMA = 0.0  # noiseless for clean reconstruction test
 
 # ── Tokenizer parameters ─────────────────────────────────────────────
