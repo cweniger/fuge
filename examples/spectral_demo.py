@@ -6,7 +6,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 import torch
 
-from fuge.spectral import DechirpSTFT
+from fuge.spectral import DechirpSTFT, PeakFinder
 
 if __name__ == "__main__":
     # Inline test signal (PN-inspired chirp, no JAX dependency)
@@ -29,6 +29,7 @@ if __name__ == "__main__":
 
     k = 4096
     decomposer = DechirpSTFT(k=k).to(device)
+    peak_finder = PeakFinder(k=k).to(device)
     noise_rms = np.sqrt(k * 3.0 / 8.0)
 
     # --- dlnf grid hyperparameters ---
@@ -61,7 +62,7 @@ if __name__ == "__main__":
         ax.set_ylim(params["f0"] * 0.5,
                      params["f0"] * (params["n_harmonics"] + 1) * 5)
 
-        peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
+        peaks, freq_refined, dlnf_refined, peak_vals = peak_finder.find_peaks(
             X_grid, K=3, dlnf_grid=dlnf_grid)
         f_peak = freq_refined.cpu().numpy() * fs / k
         dlnf_peak = dlnf_refined.cpu().numpy()
@@ -110,9 +111,9 @@ if __name__ == "__main__":
         amp_zero = X_grid[0].abs().cpu().numpy()[:, :k // 2 + 1]
         snr = amp_zero / (noise_rms * sigma)
 
-        peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
+        peaks, freq_refined, dlnf_refined, peak_vals = peak_finder.find_peaks(
             X_grid, K=3, dlnf_grid=dlnf_grid)
-        phase_start, phase_end = decomposer.peak_phases(
+        phase_start, phase_end = peak_finder.peak_phases(
             X_grid, peaks, freq_refined, dlnf_refined, dlnf_grid)
 
         # Phase residual: wrap(phase_start[w+1] - phase_end[w])

@@ -37,14 +37,17 @@ There is no formal test suite. Demo scripts live in `examples/`. No build system
 
 **Modular embedding design:** Each embedding type lives in its own subpackage under `src/fuge/`. Generic neural network components (e.g. `TransformerEmbedding`) live in `src/fuge/nn.py` and accept pre-embedded tensors of any `d_in` dimension. Import via explicit subpackage: `fuge.spectral.*`, `fuge.svd.*`, `fuge.nn.*`.
 
-### `src/fuge/spectral/core.py` — `DechirpSTFT(nn.Module)`, `ToneTokenizer(nn.Module)`
+### `src/fuge/spectral/core.py` — `DechirpSTFT`, `PeakFinder`, `NoiseModel`, `ToneTokenizer`
 
-STFT with half-overlapping Hann windows (hop = k/2). Two de-chirp modes that can be combined:
+Four classes with separated concerns:
 
-- **Phase de-chirp** (`a`): Multiplies each window by `exp(-i * a * t²)` to remove constant absolute chirp rate
-- **Resample de-chirp** (`dlnf`): Resamples onto warped time grid to remove constant *relative* chirp rate (fdot/f = const), de-chirping all harmonics simultaneously
+- **`DechirpSTFT(nn.Module)`**: STFT with half-overlapping Hann windows (hop = k/2). Two de-chirp modes: phase (`a`, multiplies by `exp(-i*a*t²)`) and resample (`dlnf`, warps time grid for constant relative chirp rate). Optionally returns weighted FFTs (`(1-t)*hann`, `t*hann`) for boundary amplitude estimation. Input: `(N,)` or `(B, N)` tensor. Output: complex `(N_WINDOWS, k)` tensor.
 
-Input: `(N,)` or `(B, N)` tensor. Output: complex `(N_WINDOWS, k)` tensor.
+- **`PeakFinder(nn.Module)`**: Finds top-K peaks in the (dlnf, freq) plane via max-pool suppression, refines positions via parabolic interpolation (with Hann bias correction), extracts phases at half-window boundaries (with dechirp-aware warping), and recovers boundary amplitudes from weighted FFTs (with scalloping correction and mixing matrix inversion).
+
+- **`NoiseModel(nn.Module)`**: Streaming noise PSD estimator. Holds a reference to a `DechirpSTFT`, maintains EMA-updated noise std per (window, freq) bin from pure noise signals. Provides `whiten()` for SNR-based peak detection.
+
+- **`ToneTokenizer(nn.Module)`**: Thin orchestrator composing `DechirpSTFT`, `PeakFinder`, and optionally `NoiseModel`. Outputs 9-field tokens: `[snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end]` with normalized frequencies and wrapped phases.
 
 The `dlnf` parameter is per-hop and internally scaled by 2 for the full window. Resampling uses linear interpolation on an exponentially warped time grid: `τ(t) = (exp(βt) - 1) / (exp(β) - 1)`.
 
@@ -73,8 +76,8 @@ fuge/
 │       ├── __init__.py              # package docstring, no flat re-exports
 │       ├── nn.py                    # TransformerEmbedding (generic)
 │       ├── spectral/
-│       │   ├── __init__.py          # re-exports: DechirpSTFT, ToneTokenizer, ToneTokenEmbedding
-│       │   ├── core.py              # DechirpSTFT, ToneTokenizer
+│       │   ├── __init__.py          # re-exports: DechirpSTFT, PeakFinder, NoiseModel, ToneTokenizer, ToneTokenEmbedding
+│       │   ├── core.py              # DechirpSTFT, PeakFinder, NoiseModel, ToneTokenizer
 │       │   └── embedding.py         # ToneTokenEmbedding
 │       └── svd/
 │           ├── __init__.py          # re-exports: StreamingPCA

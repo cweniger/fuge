@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-from fuge.spectral import ToneTokenizer, ToneTokenEmbedding
+from fuge.spectral import ToneTokenizer, ToneTokenEmbedding, NoiseModel, DechirpSTFT
 from fuge.nn import TransformerEmbedding
 
 # ── Signal parameters ────────────────────────────────────────────────
@@ -523,20 +523,22 @@ if __name__ == "__main__":
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double().to(device)
 
-    tok_psd = ToneTokenizer(
-        k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
-        dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
-    ).double().to(device)
-
-    # Estimate noise std from pure noise batches
+    # Build noise model for PSD whitening
+    stft_for_noise = DechirpSTFT(k=K_WINDOW).double().to(device)
+    noise_model = NoiseModel(stft_for_noise, momentum=0.9).to(device)
     print("Estimating noise std...")
     for _ in range(10):
         noise_batch = generate_colored_noise(64, N, T_OBS, colored_psd, rng)
-        tok_psd.update_noise_std(
-            torch.from_numpy(noise_batch).to(device, dtype=torch.float64),
-            momentum=0.9)
-    print(f"  noise_std shape: {tok_psd.noise_std.shape}")
-    print(f"  noise_std range: [{tok_psd.noise_std.min():.2e}, {tok_psd.noise_std.max():.2e}]")
+        noise_model.update(
+            torch.from_numpy(noise_batch).to(device, dtype=torch.float64))
+    print(f"  noise_std shape: {noise_model.noise_std.shape}")
+    print(f"  noise_std range: [{noise_model.noise_std.min():.2e}, {noise_model.noise_std.max():.2e}]")
+
+    tok_psd = ToneTokenizer(
+        k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
+        dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
+        noise_model=noise_model,
+    ).double().to(device)
 
     # ── 5. Tokenize all three cases ──────────────────────────────────
     print("\nTokenizing: white noise (no whitening)...")
