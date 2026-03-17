@@ -2,7 +2,7 @@
 
 Classes
 -------
-DechirpSTFT   — STFT with half-overlapping Hann windows and optional de-chirping.
+DechirpSTFT   — STFT with half-overlapping Hann windows and de-chirping.
 PeakFinder    — Find and characterize spectral peaks (frequency, phase, amplitude).
 NoiseModel    — Streaming noise PSD estimator for whitening.
 ToneTokenizer — Orchestrates STFT → whitening → peak finding → token output.
@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 
 class DechirpSTFT(nn.Module):
-    """STFT with half-overlapping Hann windows and optional de-chirping.
+    """STFT with half-overlapping Hann windows and de-chirping.
 
     Parameters
     ----------
@@ -29,24 +29,22 @@ class DechirpSTFT(nn.Module):
         super().__init__()
         self.k = k
         self.hop = k // 2
+        self.Fk = k // 2 + 1
         self.register_buffer("window", torch.hann_window(k))
         # Normalized time coordinate: t in [-1, +1] across the window
         self.register_buffer("t_norm", torch.linspace(-1.0, 1.0, k))
 
-        # Weighted windows for amplitude-at-boundary estimation
+        # Weighted windows for amplitude-at-boundary estimation:
+        # (1-t)*hann and t*hann, where t in [0, 1] across the window
+        # (t=0 at window start, t=1 at window end).
         t_unit = torch.linspace(0, 1, k)
         window = torch.hann_window(k)
         self.register_buffer("window_start", (1 - t_unit) * window)
         self.register_buffer("window_end", t_unit * window)
 
-    @property
-    def Fk(self):
-        """Number of positive-frequency bins: k // 2 + 1."""
-        return self.k // 2 + 1
-
     def forward(self, x: torch.Tensor, a: float = 0.0, dlnf=0.0,
                 return_weighted: bool = False):
-        """Compute the (de-chirped) windowed FFT.
+        """Compute the de-chirped windowed FFT.
 
         Parameters
         ----------
@@ -71,7 +69,8 @@ class DechirpSTFT(nn.Module):
             Scalar dlnf: shape (N_WINDOWS, k) or (B, N_WINDOWS, k).
             Batched dlnf: shape (D, N_WINDOWS, k) or (D, B, N_WINDOWS, k).
         X_start, X_end : complex Tensor (only if return_weighted=True)
-            Same shape as X, from (1-t)*hann and t*hann weighted windows.
+            Same shape as X, from (1-t)*hann and t*hann weighted windows,
+            where t in [0, 1] spans the window (t=0 at start, t=1 at end).
         """
         squeeze = x.dim() == 1
         if squeeze:
@@ -119,6 +118,9 @@ class DechirpSTFT(nn.Module):
             return results[0], results[1], results[2]
         return results[0]
 
+    # TODO: upsample via FFT zero-padding before warping (sinc interpolation),
+    # use grid_sample for resampling, and make upsample factor adaptive to
+    # abs(beta) for large dlnf values.
     def _resample_dechirp_batched(self, windowed: torch.Tensor, betas: torch.Tensor) -> torch.Tensor:
         """Resample windowed segments for multiple chirp rates at once.
 
@@ -184,6 +186,7 @@ class PeakFinder(nn.Module):
     def __init__(self, k: int):
         super().__init__()
         self.k = k
+        self.Fk = k // 2 + 1
 
         t_unit = torch.linspace(0, 1, k)
         window = torch.hann_window(k)
@@ -192,7 +195,8 @@ class PeakFinder(nn.Module):
 
         # Precompute 2x2 mixing matrix and its inverse.
         # The mixing matrix relates weighted FFT magnitudes to boundary
-        # amplitudes, assuming linear A(t) within the window.
+        # amplitudes, assuming linear amplitude A(t) within the window,
+        # where A(t) = A_start*(1-t) + A_end*t, t in [0, 1] across the window.
         basis_start = 1 - t_unit
         basis_end = t_unit
         M = torch.tensor([
@@ -243,11 +247,6 @@ class PeakFinder(nn.Module):
             para_grid.numpy(), para_d.numpy(), true_d.numpy())
         self.register_buffer(
             "_para_corr_lut", torch.from_numpy(true_inv).float())
-
-    @property
-    def Fk(self):
-        """Number of positive-frequency bins: k // 2 + 1."""
-        return self.k // 2 + 1
 
     def find_peaks(self, X: torch.Tensor, K: int, dlnf_grid: torch.Tensor,
                    radius: int = 2,
