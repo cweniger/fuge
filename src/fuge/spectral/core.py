@@ -66,9 +66,10 @@ class DechirpSTFT(nn.Module):
 
         Returns
         -------
-        X : complex Tensor, shape (D, B, N_WINDOWS, k) (if n_hann_splits=1)
+        X : complex Tensor, shape (D, B, N_WINDOWS, Fk) (if n_hann_splits=1)
+            Fk = k // 2 + 1 positive-frequency bins (via rfft).
         (X_start, X_end) : tuple of complex Tensors (if n_hann_splits=2)
-            Each has shape (D, B, N_WINDOWS, k).
+            Each has shape (D, B, N_WINDOWS, Fk).
         """
         if dlnf is None:
             dlnf = torch.zeros(1, device=x.device)
@@ -92,7 +93,7 @@ class DechirpSTFT(nn.Module):
             # dlnf is per hop; full window spans 2 hops
             windowed = self._resample_dechirp_batched(windowed, 2.0 * dlnf)
 
-            results.append(torch.fft.fft(windowed, n=self.k, dim=-1))
+            results.append(torch.fft.rfft(windowed, n=self.k, dim=-1))
 
         if n_hann_splits == 1:
             return results[0]
@@ -289,7 +290,7 @@ class PeakFinder(nn.Module):
         Fk = self.Fk
 
         # Merge batch and window dims: all ops are per-window
-        amp = X[..., :Fk].abs()           # (D, B, W, F)
+        amp = X.abs()                      # (D, B, W, Fk)
         amp = amp.permute(1, 2, 0, 3)     # (B, W, D, F)
         amp = amp.reshape(B * W, D, Fk)   # (BW, D, F)
         BW = B * W
@@ -398,7 +399,7 @@ class PeakFinder(nn.Module):
             Phase at sample 3k/4 (t = +0.5 in Hann window coords).
             phase_end[w] = phase_start[w+1] for noiseless signals.
         """
-        D, B, W, k_full = X.shape
+        D, B, W, Fk = X.shape
         K = peaks.shape[2]
 
         # Flatten batch*window for per-window gather
@@ -407,9 +408,9 @@ class PeakFinder(nn.Module):
         freq_ref = freq_refined.reshape(B * W, K)          # (BW, K)
 
         # TODO: investigate whether grid_sample can replace this gather.
-        # Rearrange X: (D, B, W, k) -> (B, W, D, k) -> (BW, D*k)
-        Xp = X.permute(1, 2, 0, 3).reshape(B * W, D * k_full)
-        flat_idx = dlnf_idx * k_full + freq_idx
+        # Rearrange X: (D, B, W, Fk) -> (B, W, D, Fk) -> (BW, D*Fk)
+        Xp = X.permute(1, 2, 0, 3).reshape(B * W, D * Fk)
+        flat_idx = dlnf_idx * Fk + freq_idx
         X_peak = Xp.gather(1, flat_idx)  # (BW, K) complex
 
         # Phase at window start (sample 0), corrected for fractional bin offset.
@@ -477,17 +478,16 @@ class PeakFinder(nn.Module):
         A_start, A_end : Tensor, shape (B, N_WINDOWS, K)
             Amplitude at window start and end boundaries, clamped >= 0.
         """
-        D, B, W, k_full = X_start.shape
-        Fk = self.Fk
+        D, B, W, Fk = X_start.shape
         K = peaks.shape[2]
 
         # Flatten batch*window for gathering
         dlnf_idx = peaks.reshape(B * W, K, 2)[:, :, 0]
         freq_idx = peaks.reshape(B * W, K, 2)[:, :, 1]
 
-        # Rearrange: (D, B, W, k) -> (B, W, D, Fk) -> (BW, D*Fk)
-        amp_s = X_start[..., :Fk].abs().permute(1, 2, 0, 3).reshape(B * W, D * Fk)
-        amp_e = X_end[..., :Fk].abs().permute(1, 2, 0, 3).reshape(B * W, D * Fk)
+        # Rearrange: (D, B, W, Fk) -> (B, W, D, Fk) -> (BW, D*Fk)
+        amp_s = X_start.abs().permute(1, 2, 0, 3).reshape(B * W, D * Fk)
+        amp_e = X_end.abs().permute(1, 2, 0, 3).reshape(B * W, D * Fk)
 
         flat_idx = dlnf_idx * Fk + freq_idx  # (BW, K)
         mag_s = amp_s.gather(1, flat_idx)  # (BW, K)
@@ -600,7 +600,7 @@ class NoiseModel(nn.Module):
         """
         X = self.stft(x)[0]                        # (D=1, B, W, k) -> (B, W, k)
         Fk = self.stft.Fk
-        std_new = X[..., :Fk].abs().std(dim=0)    # (W, Fk)
+        std_new = X.abs().std(dim=0)               # (W, Fk)
 
         if self.noise_std is None:
             self.noise_std = std_new
@@ -608,21 +608,18 @@ class NoiseModel(nn.Module):
             self.noise_std = self.momentum * self.noise_std + (1 - self.momentum) * std_new
 
     def whiten(self, X: torch.Tensor) -> torch.Tensor:
-        """Divide STFT positive-frequency bins by noise std.
+        """Divide STFT bins by noise std.
 
         Parameters
         ----------
-        X : complex Tensor, shape (D, B, W, k) or (B, W, k)
+        X : complex Tensor, shape (D, B, W, Fk)
 
         Returns
         -------
         X_w : complex Tensor, same shape as X.
         """
-        Fk = self.stft.Fk
         scale = 1.0 / self.noise_std.clamp(min=1e-12)     # (W, Fk)
-        X_w = X.clone()
-        X_w[..., :Fk] = X_w[..., :Fk] * scale
-        return X_w
+        return X * scale
 
 
 class ToneTokenizer(nn.Module):

@@ -50,7 +50,7 @@ if __name__ == "__main__":
         x = torch.from_numpy(x_noisy).float().to(device).unsqueeze(0)  # (1, N)
 
         X_grid = decomposer(x, dlnf=dlnf_grid)  # (D, 1, W, k)
-        amp_zero = X_grid[0, 0].abs().cpu().numpy()[:, :k // 2 + 1]
+        amp_zero = X_grid[0, 0].abs().cpu().numpy()
         snr = amp_zero / (noise_rms * sigma)
         n_windows = snr.shape[0]
         t_centers = (np.arange(n_windows) * decomposer.hop + k / 2) / fs
@@ -109,7 +109,7 @@ if __name__ == "__main__":
         x = torch.from_numpy((h + noise)).float().to(device).unsqueeze(0)  # (1, N)
         X_grid = decomposer(x, dlnf=dlnf_grid)  # (D, 1, W, k)
 
-        amp_zero = X_grid[0, 0].abs().cpu().numpy()[:, :k // 2 + 1]
+        amp_zero = X_grid[0, 0].abs().cpu().numpy()
         snr = amp_zero / (noise_rms * sigma)
 
         peaks, freq_refined, dlnf_refined, peak_vals = peak_finder.find_peaks(
