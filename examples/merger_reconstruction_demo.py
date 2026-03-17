@@ -159,8 +159,8 @@ def main():
     ).double()
 
     # Get the dlnf=0 STFT (same as what goes into peak search)
-    X0 = tokenizer.stft(x)  # (D=1, B=1, W, k)
-    stft_mag = X0[0, 0].abs().numpy()  # (W, Fk)
+    X0 = tokenizer.stft(x)  # (B=1, W, D=1, Fk)
+    stft_mag = X0[0, :, 0].abs().numpy()  # (W, Fk)
 
     tokens = tokenizer(x)  # (1, W, K, 9)
     tokens = tokens[0].numpy()  # (W, K, 9)
