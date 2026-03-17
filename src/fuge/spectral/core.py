@@ -21,7 +21,7 @@ class DechirpSTFT(nn.Module):
     k : int
         Window size in bins.  Also the FFT size per window.
 
-    Output shape: (N_WINDOWS, k)  -- complex-valued.
+    Output shape: (B, N_WINDOWS, k)  -- complex-valued.
     N_WINDOWS = (N - k) // (k // 2) + 1   (with hop = k // 2).
     """
 
@@ -40,7 +40,8 @@ class DechirpSTFT(nn.Module):
         self.register_buffer("window_start", (1 - t_unit) * self.window)
         self.register_buffer("window_end", t_unit * self.window)
 
-    def forward(self, x: torch.Tensor, dlnf=0.0, n_hann_splits: int = 1):
+    def forward(self, x: torch.Tensor, dlnf: torch.Tensor = None,
+                n_hann_splits: int = 1):
         """Compute the de-chirped windowed FFT.
 
         The de-chirp model assumes each tone has constant relative chirp
@@ -49,14 +50,13 @@ class DechirpSTFT(nn.Module):
 
         Parameters
         ----------
-        x : Tensor, shape (N,) or (B, N)
-            Time-domain signal.  If 1-D, a batch dim is added and removed.
-        dlnf : float or Tensor of shape (D,)
+        x : Tensor, shape (B, N)
+            Batched time-domain signals.
+        dlnf : Tensor of shape (D,), or None
             Relative chirp parameter: change in ln(f) per hop step,
             i.e. dlnf = (fdot/f) * T_hop  (dimensionless).
-            If a 1-D Tensor, computes the STFT for each value in parallel;
-            output gains a leading D dimension.
-            dlnf = 0 disables.
+            Computes the STFT for each value in parallel; output has a
+            leading D dimension.  Default None is equivalent to [0.].
         n_hann_splits : int
             Number of temporal sub-windows to split the Hann window into.
             1 (default): return the standard Hann-windowed FFT.
@@ -66,15 +66,12 @@ class DechirpSTFT(nn.Module):
 
         Returns
         -------
-        X : complex Tensor (if n_hann_splits=1)
-            Scalar dlnf: shape (N_WINDOWS, k) or (B, N_WINDOWS, k).
-            Batched dlnf: shape (D, N_WINDOWS, k) or (D, B, N_WINDOWS, k).
+        X : complex Tensor, shape (D, B, N_WINDOWS, k) (if n_hann_splits=1)
         (X_start, X_end) : tuple of complex Tensors (if n_hann_splits=2)
-            Each has the same shape as X would.
+            Each has shape (D, B, N_WINDOWS, k).
         """
-        squeeze = x.dim() == 1
-        if squeeze:
-            x = x.unsqueeze(0)  # (1, N)
+        if dlnf is None:
+            dlnf = torch.zeros(1, device=x.device)
 
         # Unfold into overlapping windows: (B, N_WINDOWS, k)
         raw_windows = x.unfold(dimension=1, size=self.k, step=self.hop)
@@ -88,29 +85,14 @@ class DechirpSTFT(nn.Module):
             raise ValueError(f"n_hann_splits must be 1 or 2, got {n_hann_splits}")
 
         results = []
-        batched = isinstance(dlnf, torch.Tensor) and dlnf.dim() >= 1
-
         for wf in win_funcs:
             windowed = raw_windows * wf
 
             # --- Relative de-chirp via time-grid resampling ---
             # dlnf is per hop; full window spans 2 hops
-            if batched:
-                windowed = self._resample_dechirp_batched(windowed, 2.0 * dlnf)
-            elif dlnf != 0.0:
-                windowed = self._resample_dechirp_batched(
-                    windowed,
-                    torch.tensor([2.0 * dlnf], device=windowed.device),
-                ).squeeze(0)
+            windowed = self._resample_dechirp_batched(windowed, 2.0 * dlnf)
 
             results.append(torch.fft.fft(windowed, n=self.k, dim=-1))
-
-        # Squeeze batch dim if input was 1-D
-        if squeeze:
-            results = [
-                r.squeeze(1) if batched else r.squeeze(0)
-                for r in results
-            ]
 
         if n_hann_splits == 1:
             return results[0]
@@ -280,11 +262,9 @@ class PeakFinder(nn.Module):
         Both frequency and dlnf positions are refined via parabolic
         interpolation on the amplitude and its immediate neighbours.
 
-        Supports both single and batched input.
-
         Parameters
         ----------
-        X : complex Tensor, shape (D, N_WINDOWS, k) or (D, B, N_WINDOWS, k)
+        X : complex Tensor, shape (D, B, N_WINDOWS, k)
             STFT output from forward() with a 1-D dlnf tensor.
         K : int
             Number of peaks to return per time window.
@@ -296,19 +276,15 @@ class PeakFinder(nn.Module):
 
         Returns
         -------
-        peaks : LongTensor, shape ([B,] N_WINDOWS, K, 2)
+        peaks : LongTensor, shape (B, N_WINDOWS, K, 2)
             Integer (dlnf_idx, freq_idx) of each peak.
-        freq_refined : Tensor, shape ([B,] N_WINDOWS, K)
+        freq_refined : Tensor, shape (B, N_WINDOWS, K)
             Parabolic-interpolated fractional frequency bin index.
-        dlnf_refined : Tensor, shape ([B,] N_WINDOWS, K)
+        dlnf_refined : Tensor, shape (B, N_WINDOWS, K)
             Parabolic-interpolated dlnf value.
-        values : Tensor, shape ([B,] N_WINDOWS, K)
+        values : Tensor, shape (B, N_WINDOWS, K)
             Amplitude at integer peak location.
         """
-        batched = X.dim() == 4
-        if not batched:
-            X = X.unsqueeze(1)  # (D, 1, W, k)
-
         D, B, W, k_full = X.shape
         Fk = self.Fk
 
@@ -386,12 +362,6 @@ class PeakFinder(nn.Module):
         dlnf_refined = dlnf_refined.reshape(B, W, K)
         topk_vals = topk_vals.reshape(B, W, K)
 
-        if not batched:
-            peaks = peaks.squeeze(0)
-            freq_refined = freq_refined.squeeze(0)
-            dlnf_refined = dlnf_refined.squeeze(0)
-            topk_vals = topk_vals.squeeze(0)
-
         return peaks, freq_refined, dlnf_refined, topk_vals
 
     def peak_phases(self, X: torch.Tensor, peaks: torch.Tensor,
@@ -408,34 +378,26 @@ class PeakFinder(nn.Module):
         phase_center (at the window midpoint) can be recovered as
         (phase_start + phase_end) / 2.
 
-        Supports both single and batched input.
-
         Parameters
         ----------
-        X : complex Tensor, shape (D, N_WINDOWS, k) or (D, B, N_WINDOWS, k)
-        peaks : LongTensor, shape ([B,] N_WINDOWS, K, 2)
+        X : complex Tensor, shape (D, B, N_WINDOWS, k)
+        peaks : LongTensor, shape (B, N_WINDOWS, K, 2)
             Integer (dlnf_idx, freq_idx) from find_peaks.
-        freq_refined : Tensor, shape ([B,] N_WINDOWS, K)
+        freq_refined : Tensor, shape (B, N_WINDOWS, K)
             Fractional frequency bin index (in de-chirped domain).
-        dlnf_refined : Tensor, shape ([B,] N_WINDOWS, K)
+        dlnf_refined : Tensor, shape (B, N_WINDOWS, K)
             Interpolated dlnf value (true chirp rate).
         dlnf_grid : Tensor, shape (D,)
             The dlnf grid used for de-chirping.
 
         Returns
         -------
-        phase_start : Tensor, shape ([B,] N_WINDOWS, K)
+        phase_start : Tensor, shape (B, N_WINDOWS, K)
             Phase at sample k/4 (t = -0.5 in Hann window coords).
-        phase_end : Tensor, shape ([B,] N_WINDOWS, K)
+        phase_end : Tensor, shape (B, N_WINDOWS, K)
             Phase at sample 3k/4 (t = +0.5 in Hann window coords).
             phase_end[w] = phase_start[w+1] for noiseless signals.
         """
-        batched = X.dim() == 4
-        if not batched:
-            X = X.unsqueeze(1)      # (D, 1, W, k)
-            peaks = peaks.unsqueeze(0)
-            freq_refined = freq_refined.unsqueeze(0)
-
         D, B, W, k_full = X.shape
         K = peaks.shape[2]
 
@@ -484,10 +446,6 @@ class PeakFinder(nn.Module):
         phase_start = (phi_0 + _phase_at(0.25)).reshape(B, W, K)
         phase_end = (phi_0 + _phase_at(0.75)).reshape(B, W, K)
 
-        if not batched:
-            phase_start = phase_start.squeeze(0)
-            phase_end = phase_end.squeeze(0)
-
         return phase_start, phase_end
 
     def peak_amplitudes(self, X_start: torch.Tensor, X_end: torch.Tensor,
@@ -506,26 +464,19 @@ class PeakFinder(nn.Module):
 
         Parameters
         ----------
-        X_start, X_end : complex Tensor, shape (D, N_WINDOWS, k) or (D, B, N_WINDOWS, k)
-            Weighted FFTs from forward(..., return_weighted=True).
-        peaks : LongTensor, shape ([B,] N_WINDOWS, K, 2)
+        X_start, X_end : complex Tensor, shape (D, B, N_WINDOWS, k)
+            Weighted FFTs from forward(..., n_hann_splits=2).
+        peaks : LongTensor, shape (B, N_WINDOWS, K, 2)
             Integer (dlnf_idx, freq_idx) from find_peaks.
-        freq_refined : Tensor, shape ([B,] N_WINDOWS, K)
+        freq_refined : Tensor, shape (B, N_WINDOWS, K)
             Parabolic-interpolated fractional frequency bin index from
             find_peaks, used to correct for scalloping loss.
 
         Returns
         -------
-        A_start, A_end : Tensor, shape ([B,] N_WINDOWS, K)
+        A_start, A_end : Tensor, shape (B, N_WINDOWS, K)
             Amplitude at window start and end boundaries, clamped >= 0.
         """
-        batched = X_start.dim() == 4
-        if not batched:
-            X_start = X_start.unsqueeze(1)
-            X_end = X_end.unsqueeze(1)
-            peaks = peaks.unsqueeze(0)
-            freq_refined = freq_refined.unsqueeze(0)
-
         D, B, W, k_full = X_start.shape
         Fk = self.Fk
         K = peaks.shape[2]
@@ -558,10 +509,6 @@ class PeakFinder(nn.Module):
 
         A_start = A_start.clamp(min=0.0).reshape(B, W, K)
         A_end = A_end.clamp(min=0.0).reshape(B, W, K)
-
-        if not batched:
-            A_start = A_start.squeeze(0)
-            A_end = A_end.squeeze(0)
 
         return A_start, A_end
 
@@ -648,13 +595,10 @@ class NoiseModel(nn.Module):
 
         Parameters
         ----------
-        x : Tensor, shape (B, N) or (N,)
-            Time-domain signals (pure noise).
+        x : Tensor, shape (B, N)
+            Batched time-domain signals (pure noise).
         """
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-
-        X = self.stft(x)                          # (B, W, k)
+        X = self.stft(x)[0]                        # (D=1, B, W, k) -> (B, W, k)
         Fk = self.stft.Fk
         std_new = X[..., :Fk].abs().std(dim=0)    # (W, Fk)
 
@@ -748,11 +692,11 @@ class ToneTokenizer(nn.Module):
 
         Parameters
         ----------
-        x : Tensor, shape (B, N) or (N,)
+        x : Tensor, shape (B, N)
 
         Returns
         -------
-        tokens : Tensor, shape (B, W, K, 9) or (W, K, 9)
+        tokens : Tensor, shape (B, W, K, 9)
             Values per peak: [snr, t_start, t_end, f_start, f_end, A_start,
             A_end, phase_start, phase_end].
             snr is peak amplitude (SNR when whitened).
@@ -762,10 +706,6 @@ class ToneTokenizer(nn.Module):
             phase_start/phase_end are wrapped to [-pi, pi].
             W = number of time windows, K = n_peaks.
         """
-        squeeze = x.dim() == 1
-        if squeeze:
-            x = x.unsqueeze(0)
-
         B, N = x.shape
 
         X_start, X_end = self.stft(
@@ -816,6 +756,4 @@ class ToneTokenizer(nn.Module):
         tokens = torch.stack(
             [snr, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe], dim=-1)
 
-        if squeeze:
-            tokens = tokens.squeeze(0)
         return tokens
