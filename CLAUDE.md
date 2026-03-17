@@ -41,7 +41,7 @@ There is no formal test suite. Demo scripts live in `examples/`. No build system
 
 Four classes with separated concerns:
 
-- **`DechirpSTFT(nn.Module)`**: STFT with half-overlapping Hann windows (hop = k/2). Two de-chirp modes: phase (`a`, multiplies by `exp(-i*a*t²)`) and resample (`dlnf`, warps time grid for constant relative chirp rate). Optionally returns weighted FFTs (`(1-t)*hann`, `t*hann`) for boundary amplitude estimation. Input: `(N,)` or `(B, N)` tensor. Output: complex `(N_WINDOWS, k)` tensor.
+- **`DechirpSTFT(nn.Module)`**: STFT with half-overlapping Hann windows (hop = k/2). De-chirps via resampling (`dlnf`, warps time grid for constant relative chirp rate `f(t) = f_center * exp(dlnf * t/hop)`). With `n_hann_splits=2`, returns boundary FFTs `(X_start, X_end)` from `(1-t)*hann` and `t*hann` windows for amplitude estimation; standard FFT is `X = X_start + X_end`. Input: `(N,)` or `(B, N)` tensor. Output: complex `(N_WINDOWS, k)` tensor.
 
 - **`PeakFinder(nn.Module)`**: Finds top-K peaks in the (dlnf, freq) plane via max-pool suppression, refines positions via parabolic interpolation (with Hann bias correction), extracts phases at half-window boundaries (with dechirp-aware warping), and recovers boundary amplitudes from weighted FFTs (with scalloping correction and mixing matrix inversion).
 

@@ -2,7 +2,7 @@
 
 Classes
 -------
-DechirpSTFT   — STFT with half-overlapping Hann windows and de-chirping.
+DechirpSTFT   — STFT with half-overlapping Hann windows and resample de-chirping.
 PeakFinder    — Find and characterize spectral peaks (frequency, phase, amplitude).
 NoiseModel    — Streaming noise PSD estimator for whitening.
 ToneTokenizer — Orchestrates STFT → whitening → peak finding → token output.
@@ -31,46 +31,46 @@ class DechirpSTFT(nn.Module):
         self.hop = k // 2
         self.Fk = k // 2 + 1
         self.register_buffer("window", torch.hann_window(k))
-        # Normalized time coordinate: t in [-1, +1] across the window
-        self.register_buffer("t_norm", torch.linspace(-1.0, 1.0, k))
 
         # Weighted windows for amplitude-at-boundary estimation:
         # (1-t)*hann and t*hann, where t in [0, 1] across the window
         # (t=0 at window start, t=1 at window end).
+        # Note: window = window_start + window_end by construction.
         t_unit = torch.linspace(0, 1, k)
-        window = torch.hann_window(k)
-        self.register_buffer("window_start", (1 - t_unit) * window)
-        self.register_buffer("window_end", t_unit * window)
+        self.register_buffer("window_start", (1 - t_unit) * self.window)
+        self.register_buffer("window_end", t_unit * self.window)
 
-    def forward(self, x: torch.Tensor, a: float = 0.0, dlnf=0.0,
-                return_weighted: bool = False):
+    def forward(self, x: torch.Tensor, dlnf=0.0, n_hann_splits: int = 1):
         """Compute the de-chirped windowed FFT.
+
+        The de-chirp model assumes each tone has constant relative chirp
+        rate within a window: f(t) = f_center * exp(dlnf * (t - t_center) / hop),
+        where dlnf = d(ln f)/d(hop) is dimensionless.
 
         Parameters
         ----------
         x : Tensor, shape (N,) or (B, N)
             Time-domain signal.  If 1-D, a batch dim is added and removed.
-        a : float
-            Absolute chirp rate parameter.  Multiplies each window by
-            exp(-i * a * t^2) where t in [-1, +1].  a = 0 disables.
         dlnf : float or Tensor of shape (D,)
             Relative chirp parameter: change in ln(f) per hop step,
             i.e. dlnf = (fdot/f) * T_hop  (dimensionless).
             If a 1-D Tensor, computes the STFT for each value in parallel;
             output gains a leading D dimension.
             dlnf = 0 disables.
-        return_weighted : bool
-            If True, also return weighted FFTs for amplitude boundary
-            estimation.  Returns (X, X_start, X_end).
+        n_hann_splits : int
+            Number of temporal sub-windows to split the Hann window into.
+            1 (default): return the standard Hann-windowed FFT.
+            2: return (X_start, X_end) from (1-t)*hann and t*hann windows
+               (t in [0,1] across the window).  The standard Hann FFT can
+               be recovered as X = X_start + X_end.
 
         Returns
         -------
-        X : complex Tensor
+        X : complex Tensor (if n_hann_splits=1)
             Scalar dlnf: shape (N_WINDOWS, k) or (B, N_WINDOWS, k).
             Batched dlnf: shape (D, N_WINDOWS, k) or (D, B, N_WINDOWS, k).
-        X_start, X_end : complex Tensor (only if return_weighted=True)
-            Same shape as X, from (1-t)*hann and t*hann weighted windows,
-            where t in [0, 1] spans the window (t=0 at start, t=1 at end).
+        (X_start, X_end) : tuple of complex Tensors (if n_hann_splits=2)
+            Each has the same shape as X would.
         """
         squeeze = x.dim() == 1
         if squeeze:
@@ -80,9 +80,12 @@ class DechirpSTFT(nn.Module):
         raw_windows = x.unfold(dimension=1, size=self.k, step=self.hop)
 
         # Build list of windows to process
-        win_funcs = [self.window]
-        if return_weighted:
-            win_funcs += [self.window_start, self.window_end]
+        if n_hann_splits == 2:
+            win_funcs = [self.window_start, self.window_end]
+        elif n_hann_splits == 1:
+            win_funcs = [self.window]
+        else:
+            raise ValueError(f"n_hann_splits must be 1 or 2, got {n_hann_splits}")
 
         results = []
         batched = isinstance(dlnf, torch.Tensor) and dlnf.dim() >= 1
@@ -100,11 +103,6 @@ class DechirpSTFT(nn.Module):
                     torch.tensor([2.0 * dlnf], device=windowed.device),
                 ).squeeze(0)
 
-            # --- Absolute de-chirp via phase multiplication ---
-            if a != 0.0:
-                chirp_kernel = torch.exp(-1j * a * self.t_norm ** 2)
-                windowed = windowed * chirp_kernel
-
             results.append(torch.fft.fft(windowed, n=self.k, dim=-1))
 
         # Squeeze batch dim if input was 1-D
@@ -114,9 +112,9 @@ class DechirpSTFT(nn.Module):
                 for r in results
             ]
 
-        if return_weighted:
-            return results[0], results[1], results[2]
-        return results[0]
+        if n_hann_splits == 1:
+            return results[0]
+        return tuple(results)
 
     # TODO: upsample via FFT zero-padding before warping (sinc interpolation),
     # use grid_sample for resampling, and make upsample factor adaptive to
@@ -181,22 +179,37 @@ class PeakFinder(nn.Module):
     ----------
     k : int
         Window size (must match the DechirpSTFT that produced the input).
+    correct_parabolic : bool
+        Apply Hann-window parabolic interpolation bias correction (default True).
+    correct_scalloping : bool
+        Apply scalloping loss correction for boundary amplitude recovery (default True).
     """
 
-    def __init__(self, k: int):
+    def __init__(self, k: int, correct_parabolic: bool = True,
+                 correct_scalloping: bool = True):
         super().__init__()
         self.k = k
         self.Fk = k // 2 + 1
+        self.correct_parabolic = correct_parabolic
+        self.correct_scalloping = correct_scalloping
 
+        self._init_amplitude_unmix(k)
+        if correct_scalloping:
+            self._init_scalloping_lut(k)
+        if correct_parabolic:
+            self._init_parabolic_lut(k)
+
+    def _init_amplitude_unmix(self, k: int):
+        """Precompute the 2x2 mixing matrix inverse for boundary amplitudes.
+
+        The mixing matrix relates weighted FFT magnitudes to boundary
+        amplitudes, assuming linear amplitude A(t) within the window,
+        where A(t) = A_start*(1-t) + A_end*t, t in [0, 1] across the window.
+        """
         t_unit = torch.linspace(0, 1, k)
         window = torch.hann_window(k)
         window_start = (1 - t_unit) * window
         window_end = t_unit * window
-
-        # Precompute 2x2 mixing matrix and its inverse.
-        # The mixing matrix relates weighted FFT magnitudes to boundary
-        # amplitudes, assuming linear amplitude A(t) within the window,
-        # where A(t) = A_start*(1-t) + A_end*t, t in [0, 1] across the window.
         basis_start = 1 - t_unit
         basis_end = t_unit
         M = torch.tensor([
@@ -205,16 +218,21 @@ class PeakFinder(nn.Module):
         ])
         self.register_buffer("amp_unmix", torch.linalg.inv(M))
 
-        # Precompute scalloping correction lookup table for weighted windows.
-        # At fractional bin offset delta, the FFT magnitude is reduced by
-        # |DTFT(w, delta)| / |DTFT(w, 0)|.  We store the inverse of this
-        # ratio on a dense grid for fast interpolation at runtime.
-        # w_start and w_end have nearly identical scalloping (verified
-        # numerically: ratio differs by < 0.01% at delta=0.5).
+    def _init_scalloping_lut(self, k: int):
+        """Precompute scalloping correction lookup table for weighted windows.
+
+        At fractional bin offset delta, the FFT magnitude is reduced by
+        |DTFT(w, delta)| / |DTFT(w, 0)|.  We store the inverse of this
+        ratio on a dense grid for fast interpolation at runtime.
+        w_start and w_end have nearly identical scalloping (verified
+        numerically: ratio differs by < 0.01% at delta=0.5).
+        """
+        # TODO: test whether this correction is significant in practice.
         n_lut = 64  # half-bin resolution: 0 to 0.5
         ns = torch.arange(k, dtype=torch.float64)
         delta_lut = torch.linspace(0, 0.5, n_lut)
-        w_ref = window_start.double()
+        t_unit = torch.linspace(0, 1, k)
+        w_ref = ((1 - t_unit) * torch.hann_window(k)).double()
         dtft_mag = torch.zeros(n_lut)
         for i, d in enumerate(delta_lut):
             phasor = torch.exp(2j * torch.pi * d * ns / k)
@@ -222,15 +240,19 @@ class PeakFinder(nn.Module):
         scallop_lut = dtft_mag[0] / dtft_mag.clamp(min=1e-12)
         self.register_buffer("_scallop_lut", scallop_lut.float())
 
-        # Precompute parabolic interpolation correction LUT.
-        # Parabolic interpolation on Hann-windowed data systematically
-        # underestimates fractional bin offsets (e.g. true 0.4 -> estimated 0.36).
-        # We precompute the exact forward mapping true_delta -> para_delta using
-        # the known Hann DTFT, then store the inverse for runtime correction.
+    def _init_parabolic_lut(self, k: int):
+        """Precompute parabolic interpolation correction LUT.
+
+        Parabolic interpolation on Hann-windowed data systematically
+        underestimates fractional bin offsets (e.g. true 0.4 -> estimated 0.36).
+        We precompute the exact forward mapping true_delta -> para_delta using
+        the known Hann DTFT, then store the inverse for runtime correction.
+        """
         n_corr = 1000  # dense forward mapping
+        ns = torch.arange(k, dtype=torch.float64)
         true_d = torch.linspace(0, 0.5, n_corr, dtype=torch.float64)
         para_d = torch.zeros(n_corr, dtype=torch.float64)
-        w_hann = window.double()
+        w_hann = torch.hann_window(k).double()
         for i, td in enumerate(true_d):
             mags = []
             for off in [-1, 0, 1]:
@@ -337,7 +359,8 @@ class PeakFinder(nn.Module):
         f_delta = 0.5 * (yf_m - yf_p) / f_denom
         f_delta = torch.where(f_denom.abs() < 1e-12, torch.zeros_like(f_delta), f_delta)
         f_delta = f_delta.clamp(-0.5, 0.5)
-        f_delta = self._correct_parabolic(f_delta)
+        if self.correct_parabolic:
+            f_delta = self._correct_parabolic(f_delta)
         freq_refined = fi.float() + f_delta
 
         # --- Parabolic interpolation along dlnf axis ---
@@ -421,6 +444,7 @@ class PeakFinder(nn.Module):
         freq_idx = peaks.reshape(B * W, K, 2)[:, :, 1]    # (BW, K)
         freq_ref = freq_refined.reshape(B * W, K)          # (BW, K)
 
+        # TODO: investigate whether grid_sample can replace this gather.
         # Rearrange X: (D, B, W, k) -> (B, W, D, k) -> (BW, D*k)
         Xp = X.permute(1, 2, 0, 3).reshape(B * W, D * k_full)
         flat_idx = dlnf_idx * k_full + freq_idx
@@ -519,10 +543,11 @@ class PeakFinder(nn.Module):
         mag_e = amp_e.gather(1, flat_idx)  # (BW, K)
 
         # Correct for scalloping loss at fractional bin offset
-        delta = freq_refined.reshape(B * W, K) - freq_idx.float()
-        scallop_corr = self._scallop_correction(delta)
-        mag_s = mag_s * scallop_corr
-        mag_e = mag_e * scallop_corr
+        if self.correct_scalloping:
+            delta = freq_refined.reshape(B * W, K) - freq_idx.float()
+            scallop_corr = self._scallop_correction(delta)
+            mag_s = mag_s * scallop_corr
+            mag_e = mag_e * scallop_corr
 
         # Apply inverse mixing matrix: [A_start, A_end] = amp_unmix @ [mag_s, mag_e]
         # Then multiply by 2 to correct for the cosine→complex exponential
@@ -743,8 +768,9 @@ class ToneTokenizer(nn.Module):
 
         B, N = x.shape
 
-        X, X_start, X_end = self.stft(
-            x, dlnf=self.dlnf_grid, return_weighted=True)  # (D, B, W, k)
+        X_start, X_end = self.stft(
+            x, dlnf=self.dlnf_grid, n_hann_splits=2)  # (D, B, W, k)
+        X = X_start + X_end  # standard Hann-windowed FFT
 
         if self.noise_model is not None:
             X_w = self.noise_model.whiten(X)
