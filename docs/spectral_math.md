@@ -346,22 +346,52 @@ applied before peak selection.
 
 ## 6. Phase extraction
 
-### Natural anchor: window center in τ-space
+### Decoupling of phase and frequency estimation
 
-The periodic Hann window is exactly symmetric about sample k/2, and
-its value at sample 0 is exactly zero (w[0] = 0).  These two facts
-together mean that the DTFT of the centered window is purely real,
-giving a clean phase relationship.
+The FFT of a windowed signal x[n] = A·exp(i(2π·f·n/k + φ₀)) at
+integer bin m, where f = m + δ (fractional offset δ), gives:
 
-For the periodic Hann of length k, the FFT phase at integer bin m
-relates to the phase at the window center (sample k/2, t = 0) by:
+    X[m] = A·exp(iφ₀) · W(δ)
+
+where W(δ) = Σ_n w[n]·exp(2πi·δ·n/k) is the window's DTFT.  W(δ)
+is complex with phase ψ(δ), so recovering φ₀ requires knowing δ:
+
+    φ₀ = arg(X[m]) − ψ(δ)
+
+Any error in δ (from parabolic interpolation) propagates directly
+into the phase estimate.
+
+For the periodic Hann, rewriting the DTFT centered at sample k/2
+(n = k/2 + j) gives:
+
+    W(δ) = exp(iπδ) · Σ_j w[k/2+j] · exp(2πi·δ·j/k)
+
+The inner sum is **real** because (a) w is symmetric about k/2
+(w[k/2+j] = w[k/2−j]) and (b) w[0] = 0 (the asymmetric boundary
+term vanishes).  Therefore ψ(δ) = πδ.
+
+The phase at the window center (sample k/2) is
+φ_center = φ₀ + π(m + δ).  Substituting φ₀ = arg(X[m]) − πδ:
+
+    φ_center = arg(X[m]) − πδ + π(m + δ) = arg(X[m]) + π·m
+
+**The δ cancels exactly.**  The phase at the symmetry center of the
+window is determined by the integer bin index alone — the fractional
+offset δ drops out.  This means frequency estimation (parabolic
+refinement of δ) and phase estimation (φ_center) are completely
+decoupled: errors in one do not affect the other.
+
+This property holds for any window symmetric about sample c with
+w[0] = 0.  The symmetry center is the unique point where the phase
+measurement is δ-independent.
+
+### Phase anchor at window center
+
+For the periodic Hann of length k, the formula is:
 
     φ_center = arg(X[m]) + π · m
 
-This is exact and **does not depend on the fractional bin offset δ**.
-The proof: shifting the DFT sum to center at k/2 pulls out a factor
-exp(−iπm); the remaining sum over the symmetric window is real
-(the asymmetric boundary term at n = 0 vanishes because w[0] = 0).
+where m = freq_idx (integer bin of the peak).
 
 The anchor point is the window center in τ-space (sample k/2 of the
 dechirped grid), which corresponds to physical time
