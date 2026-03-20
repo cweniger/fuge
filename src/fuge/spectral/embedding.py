@@ -15,6 +15,13 @@ Input token format (from ChirpTokenizer):
 import torch
 import torch.nn as nn
 
+from fuge.spectral.tokens import ChirpTokens
+
+
+def _to_tensor(x):
+    """Accept ChirpTokens or raw Tensor, return the underlying tensor."""
+    return x.data if isinstance(x, ChirpTokens) else x
+
 
 class ChirpTokenEmbedding(nn.Module):
     """Embed raw chirp tokens into model-ready features.
@@ -47,9 +54,9 @@ class ChirpTokenEmbedding(nn.Module):
 
         Parameters
         ----------
-        raw_tokens : Tensor, shape (B, W, K, 9)
+        raw_tokens : ChirpTokens or Tensor, shape (B, W, K, C)
         """
-        embedded = self._embed(raw_tokens)
+        embedded = self._embed(_to_tensor(raw_tokens))
         flat = embedded.reshape(-1, self.n_embed)
         self.mean = flat.mean(dim=0)
         self.std = flat.std(dim=0).clamp(min=1e-8)
@@ -90,7 +97,7 @@ class ChirpTokenEmbedding(nn.Module):
 
         Parameters
         ----------
-        raw_tokens : Tensor, shape (B, W, K, 9)
+        raw_tokens : ChirpTokens or Tensor, shape (B, W, K, C)
 
         Returns
         -------
@@ -98,6 +105,7 @@ class ChirpTokenEmbedding(nn.Module):
         n_windows : int
         n_peaks : int
         """
+        raw_tokens = _to_tensor(raw_tokens)
         B, W, K, _ = raw_tokens.shape
         embedded = self._embed(raw_tokens)
         normalized = (embedded - self.mean) / self.std

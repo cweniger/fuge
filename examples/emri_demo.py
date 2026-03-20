@@ -191,7 +191,7 @@ if __name__ == "__main__":
 
     # Panel 3: Chirp tokens
     ax = axes[2]
-    tok = tokens[0].cpu()
+    tok = tokens.data[0].cpu()
     W_tok, K, _ = tok.shape
     for ki in range(K):
         t_mid = (tok[:, ki, 1] + tok[:, ki, 2]) / 2
