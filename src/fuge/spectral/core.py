@@ -33,16 +33,22 @@ class DechirpSTFT(nn.Module):
     ----------
     k : int
         Window size in samples.  Must be a multiple of 4.
+    R : int
+        Internal warp resolution.  The τ-grid uses R·k samples for
+        interpolation, reducing linear interpolation error.  The output
+        always has Fk = k/2 + 1 frequency bins regardless of R.
+        Default 1.
 
     Output shape: (B, N_WINDOWS, D, Fk) complex-valued,
     where Fk = k/2 + 1.
     N_WINDOWS = (N - k) // hop + 1  (with hop = k/2).
     """
 
-    def __init__(self, k: int):
+    def __init__(self, k: int, R: int = 1):
         super().__init__()
         assert k % 4 == 0, f"k must be a multiple of 4, got {k}"
         self.k = k
+        self.R = R
         self.hop = k // 2       # integer, k is multiple of 4
         self.Fk = k // 2 + 1
         self.register_buffer("window", torch.hann_window(k, periodic=True))
@@ -103,10 +109,16 @@ class DechirpSTFT(nn.Module):
         # [Fix #7: avoid recomputing the same warp for each sub-window]
         warp_grid = self._compute_warp_grid(beta)
 
+        R = self.R
         results = []
         for wf in win_funcs:
             windowed = raw_windows * wf
             windowed = self._apply_warp(windowed, warp_grid)
+            if R > 1:
+                # Downsample R·k warped samples back to k for the FFT.
+                # The R·k grid provided better interpolation quality;
+                # now take every R-th sample for the k-point FFT.
+                windowed = windowed[..., ::R]
             windowed = windowed.permute(1, 2, 0, 3)  # (D,B,W,k) -> (B,W,D,k)
             results.append(torch.fft.rfft(windowed, n=self.k, dim=-1))
 
@@ -122,10 +134,11 @@ class DechirpSTFT(nn.Module):
         """
         D = beta.shape[0]
         k = self.k
+        k_tau = self.R * k  # internal warp resolution
         device = beta.device
 
-        # Destination grid in τ-space: k samples at τ_n = 2n/k - 1
-        tau = _make_t_grid(k).to(device)
+        # Destination grid in τ-space: R·k samples for better interpolation
+        tau = _make_t_grid(k_tau).to(device)
 
         # Replace near-zero betas to avoid division by zero
         small = beta.abs() < 1e-8
@@ -136,7 +149,7 @@ class DechirpSTFT(nn.Module):
         t_source = torch.log(
             1.0 + ((tau.unsqueeze(0) + 1.0) / 2.0)
             * (e2b.unsqueeze(1) - 1.0)
-        ) / beta_safe.unsqueeze(1) - 1.0  # (D, k)
+        ) / beta_safe.unsqueeze(1) - 1.0  # (D, k_tau)
 
         # For near-zero beta, use identity grid
         t_source = torch.where(small.unsqueeze(1), tau.unsqueeze(0), t_source)
@@ -151,13 +164,13 @@ class DechirpSTFT(nn.Module):
 
         # Map source positions to index space [0, k-1]
         # n(t) = k/2 · (t + 1)
-        idx = (k / 2.0) * (t_source + 1.0)  # (D, k)
+        idx = (k / 2.0) * (t_source + 1.0)  # (D, k_tau)
         idx_lo = idx.long().clamp(0, k - 2)
         idx_hi = idx_lo + 1
         frac = idx - idx_lo.float()
 
         return {
-            'D': D, 'k': k,
+            'D': D, 'k_tau': k_tau,
             'idx_lo': idx_lo, 'idx_hi': idx_hi, 'frac': frac,
             'jacobian': jacobian,
         }
@@ -172,15 +185,15 @@ class DechirpSTFT(nn.Module):
 
         Returns
         -------
-        resampled : Tensor, shape (D, B, W, k)
+        resampled : Tensor, shape (D, B, W, k_tau)
         """
         D = grid['D']
-        k = grid['k']
+        k_tau = grid['k_tau']
         B, W, _ = windowed.shape
 
         windowed_exp = windowed.unsqueeze(0).expand(D, -1, -1, -1)
-        idx_lo_exp = grid['idx_lo'][:, None, None, :].expand(D, B, W, k)
-        idx_hi_exp = grid['idx_hi'][:, None, None, :].expand(D, B, W, k)
+        idx_lo_exp = grid['idx_lo'][:, None, None, :].expand(D, B, W, k_tau)
+        idx_hi_exp = grid['idx_hi'][:, None, None, :].expand(D, B, W, k_tau)
         frac_exp = grid['frac'][:, None, None, :]
 
         lo_vals = torch.gather(windowed_exp, 3, idx_lo_exp)

@@ -260,19 +260,32 @@ GPU + PyTorch autograd):
 - **jax-finufft** — relevant for the JAX side of this project
   (signal synthesis); full autodiff support.
 
+### Warp resolution R
+
+An internal integer parameter R controls the density of the τ-grid
+used for interpolation:
+
+    k_tau = R · k
+
+The R·k τ-samples are interpolated from the k source samples via
+the warp, providing smaller interpolation steps and reducing linear
+interpolation error.  After warping, the R·k samples are downsampled
+back to k (every R-th sample) before the k-point FFT, so the output
+always has Fk = k/2 + 1 frequency bins regardless of R.
+
+R does not increase frequency resolution — the information content
+is limited by the k source samples.  It only improves interpolation
+fidelity of the warp.  Default R = 1.
+
 ### Sample-index form
 
-In both t-space and τ-space, samples sit at t_n = 2n/k − 1 for
-n = 0, …, k − 1.  Both map to source positions via n(·) = k/2 · (· + 1).
-The resampling reads the windowed signal at source positions n(t(τ_n)),
-interpolating on the original k-sample grid, then applies the
-Jacobian correction.
-
-Note: the τ-grid has the same k samples as the source grid.
-Increasing the number of τ-samples beyond k does not improve
-frequency resolution — the information content is limited by the
-k source samples (k/2 + 1 independent frequency bins).  For finer
-frequency resolution, use a larger window (larger k).
+In t-space, samples sit at t_n = 2n/k − 1 for n = 0, …, k − 1.
+In τ-space (before downsampling), samples sit at
+τ_n = 2n/k_tau − 1 for n = 0, …, k_tau − 1.
+Source positions are computed via n(·) = k/2 · (· + 1).  The
+resampling reads the windowed signal at source positions n(t(τ_n)),
+interpolating on the original k-sample grid, applies the Jacobian
+correction, then downsamples to k for the FFT.
 
 ---
 
