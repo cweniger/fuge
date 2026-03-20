@@ -260,32 +260,40 @@ GPU + PyTorch autograd):
 - **jax-finufft** — relevant for the JAX side of this project
   (signal synthesis); full autodiff support.
 
-### Warp resolution R
+### Open problem: τ-grid oversampling
 
-An internal integer parameter R controls the density of the τ-grid
-used for interpolation:
+The warp compresses low-frequency regions (fewer τ-samples per cycle)
+and stretches high-frequency regions.  At the compressed end, linear
+interpolation between source samples does not average over the bin
+width — it just blends two neighbors.  This means the noise per
+τ-sample is not reduced the way a proper bin-average would be, leading
+to slightly elevated noise at the low-frequency end.
 
-    k_tau = R · k
+A natural idea: use R·k τ-samples (denser grid), then downsample
+back to k before the FFT.  This reduces interpolation gaps and could
+provide anti-aliasing.  However:
 
-The R·k τ-samples are interpolated from the k source samples via
-the warp, providing smaller interpolation steps and reducing linear
-interpolation error.  After warping, the R·k samples are downsampled
-back to k (every R-th sample) before the k-point FFT, so the output
-always has Fk = k/2 + 1 frequency bins regardless of R.
+- **Subsampling (every R-th sample)** discards the extra interpolation
+  work — the result is identical to R=1.
+- **Averaging (groups of R)** acts as a box-car anti-aliasing filter,
+  but introduces frequency-dependent amplitude attenuation
+  (sinc(f·R/k) per bin), requiring a correction that negates much
+  of the simplicity.
+- **R·k-point FFT with bin subsampling** gives wrong frequency bins
+  because the linearly-interpolated warped signal has different
+  spectral structure than a zero-padded signal.
 
-R does not increase frequency resolution — the information content
-is limited by the k source samples.  It only improves interpolation
-fidelity of the warp.  Default R = 1.
+The proper solution is a type-2 NUFFT backend (§3.5), which uses
+an optimized interpolation kernel (Kaiser–Bessel) that inherently
+handles anti-aliasing.  This is left for future work.
 
 ### Sample-index form
 
-In t-space, samples sit at t_n = 2n/k − 1 for n = 0, …, k − 1.
-In τ-space (before downsampling), samples sit at
-τ_n = 2n/k_tau − 1 for n = 0, …, k_tau − 1.
-Source positions are computed via n(·) = k/2 · (· + 1).  The
-resampling reads the windowed signal at source positions n(t(τ_n)),
-interpolating on the original k-sample grid, applies the Jacobian
-correction, then downsamples to k for the FFT.
+In both t-space and τ-space, samples sit at t_n = 2n/k − 1 for
+n = 0, …, k − 1.  Source positions are computed via
+n(·) = k/2 · (· + 1).  The resampling reads the windowed signal at
+source positions n(t(τ_n)), interpolating on the original k-sample
+grid, then applies the Jacobian correction.
 
 ---
 
