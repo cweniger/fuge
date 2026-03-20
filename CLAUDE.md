@@ -26,6 +26,9 @@ python examples/spectral_demo.py
 # Run chirp signal generator demo (generates chirp_demo.png)
 python examples/chirp_demo.py
 
+# Run voice stitching demo (generates voice_demo.png)
+python examples/voice_demo.py
+
 # Run streaming PCA demo (generates svd_demo_procrustes.png, svd_demo_wiener.png)
 python examples/svd_demo.py
 ```
@@ -56,6 +59,10 @@ Four classes with separated concerns. See `docs/spectral_math.md` for the full m
 
 The `dlnf` parameter is per-hop; `β = 2·dlnf` is the total log-frequency change across the full window. Resampling uses linear interpolation on an exponentially warped time grid: `τ(t) = [exp(β·t) − exp(−β)] / sinh(β) − 1`. |dlnf| ≤ 0.5 supported.
 
+### `src/fuge/spectral/voice.py` — `VoiceStitcher(nn.Module)`, `VoiceStitchConfig`
+
+Stitches chirp tokens into phase-coherent voices.  Builds a DAG of compatible tokens across adjacent windows (matching on frequency, phase, and amplitude), resolves branching via greedy highest-SNR path selection, and produces anchor-point sequences with coherently unwrapped phase.  Each voice is a `(V+1, 4)` tensor of `[amplitude, time, phase, frequency]` at boundary anchor points.  Phase stitching uses exact within-window advances and wrapped boundary corrections: `φ[i+1] = φ[i] + wrap(φ_start[i] − φ_end[i−1]) + (φ_end[i] − φ_start[i])`.
+
 ### `src/fuge/spectral/embedding.py` — `ChirpTokenEmbedding(nn.Module)`
 
 Transforms raw chirp tokens (snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end) into model-ready embedded features with z-score normalization. SNR is peak amplitude from the (optionally whitened) STFT. Time and frequency boundaries tile the signal; boundary amplitudes are recovered via weighted FFTs with complementary time weights. (Was `ToneTokenEmbedding`.)
@@ -84,8 +91,9 @@ fuge/
 │       ├── __init__.py              # package docstring, no flat re-exports
 │       ├── nn.py                    # TransformerEmbedding (generic)
 │       ├── spectral/
-│       │   ├── __init__.py          # re-exports: DechirpSTFT, PeakFinder, NoiseModel, ChirpTokenizer, ChirpTokenEmbedding
+│       │   ├── __init__.py          # re-exports: DechirpSTFT, PeakFinder, NoiseModel, ChirpTokenizer, ChirpTokenEmbedding, VoiceStitcher, VoiceStitchConfig
 │       │   ├── core.py              # DechirpSTFT, PeakFinder, NoiseModel, ChirpTokenizer
+│       │   ├── voice.py             # VoiceStitcher, VoiceStitchConfig
 │       │   └── embedding.py         # ChirpTokenEmbedding
 │       └── svd/
 │           ├── __init__.py          # re-exports: StreamingPCA
@@ -97,6 +105,7 @@ fuge/
     ├── transformer_demo.py
     ├── psd_whitening_demo.py
     ├── fisher_demo.py
+    ├── voice_demo.py
     └── svd_demo.py
 ```
 
