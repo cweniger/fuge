@@ -15,9 +15,15 @@ Coordinate convention (see docs/spectral_math.md):
     β = 2·dlnf (total log-frequency change across the full window).
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _make_t_grid(k: int, dtype=torch.float32) -> torch.Tensor:
+    """Discrete sample grid: t_n = 2n/k - 1 for n = 0, …, k-1."""
+    return 2 * torch.arange(k, dtype=dtype) / k - 1
 
 
 class DechirpSTFT(nn.Module):
@@ -49,7 +55,7 @@ class DechirpSTFT(nn.Module):
         # Weighted sub-windows for boundary amplitude estimation.
         # t ∈ [-1, 1] across the window; w_start = ((1-t)/2)·hann,
         # w_end = ((1+t)/2)·hann.  w_start + w_end = hann.
-        t = 2 * torch.arange(k, dtype=torch.float32) / k - 1  # t_n = 2n/k - 1
+        t = _make_t_grid(k)
         self.register_buffer("window_start", ((1 - t) / 2) * self.window)
         self.register_buffer("window_end", ((1 + t) / 2) * self.window)
 
@@ -98,54 +104,40 @@ class DechirpSTFT(nn.Module):
         else:
             raise ValueError(f"n_hann_splits must be 1 or 2, got {n_hann_splits}")
 
+        # Precompute warp grid and Jacobian (shared across sub-windows)
+        # [Fix #7: avoid recomputing the same warp for each sub-window]
+        warp_grid = self._compute_warp_grid(beta)
+
         results = []
         for wf in win_funcs:
             windowed = raw_windows * wf
-
-            # Resample via dechirp warp: (B, W, k) -> (D, B, W, k_tau)
-            windowed = self._resample_dechirp_batched(windowed, beta)
-            # Permute to (B, W, D, k_tau)
-            windowed = windowed.permute(1, 2, 0, 3)
-
+            windowed = self._apply_warp(windowed, warp_grid)
+            windowed = windowed.permute(1, 2, 0, 3)  # (D,B,W,k_tau) -> (B,W,D,k_tau)
             results.append(torch.fft.rfft(windowed, n=self.k_tau, dim=-1))
 
         if n_hann_splits == 1:
             return results[0]
         return tuple(results)
 
-    def _resample_dechirp_batched(self, windowed: torch.Tensor,
-                                  beta: torch.Tensor) -> torch.Tensor:
-        """Resample windowed segments for multiple chirp rates at once.
+    def _compute_warp_grid(self, beta: torch.Tensor):
+        """Precompute warp source positions and Jacobian for given β values.
 
-        Computes the chirped matched filter by resampling (gridding) the
-        windowed signal onto a uniform τ-grid, with Jacobian correction
-        for amplitude fidelity.
-
-        Parameters
-        ----------
-        windowed : Tensor, shape (B, N_WINDOWS, k)
-        beta : Tensor, shape (D,)
-            β = 2·dlnf, total log-frequency change across the full window.
-
-        Returns
-        -------
-        resampled : Tensor, shape (D, B, N_WINDOWS, k_tau)
+        Returns a dict with t_source, jacobian, idx_lo, idx_hi, frac
+        that can be reused across sub-windows.
         """
         D = beta.shape[0]
         k = self.k
         k_tau = self.k_tau
+        device = beta.device
 
         # Destination grid in τ-space: k_tau samples at τ_n = 2n/k_tau - 1
-        tau = (2 * torch.arange(k_tau, device=windowed.device, dtype=torch.float32)
-               / k_tau - 1)  # (k_tau,)
+        tau = _make_t_grid(k_tau).to(device)
 
-        # Replace near-zero betas to avoid division by zero;
-        # for |beta| < eps the warped grid is effectively identity.
+        # Replace near-zero betas to avoid division by zero
         small = beta.abs() < 1e-8
         beta_safe = torch.where(small, torch.ones_like(beta) * 1e-8, beta)
 
         # Inverse warp: t(τ) = ln[1 + ((τ+1)/2)·(exp(2β)-1)] / β - 1
-        # (see docs/spectral_math.md §3)
         e2b = torch.exp(2.0 * beta_safe)  # (D,)
         t_source = torch.log(
             1.0 + ((tau.unsqueeze(0) + 1.0) / 2.0)
@@ -153,40 +145,56 @@ class DechirpSTFT(nn.Module):
         ) / beta_safe.unsqueeze(1) - 1.0  # (D, k_tau)
 
         # For near-zero beta, use identity grid
-        t_source = torch.where(
-            small.unsqueeze(1),
-            tau.unsqueeze(0),
-            t_source)
+        t_source = torch.where(small.unsqueeze(1), tau.unsqueeze(0), t_source)
 
-        # Jacobian correction: exp(-β · (t(τ) - t(0)))
-        # t(0) for the midpoint of τ-grid: t at τ = 2*(k_tau//2)/k_tau - 1
-        tau_mid = 2.0 * (k_tau // 2) / k_tau - 1.0
-        t_mid = torch.log(
-            1.0 + ((tau_mid + 1.0) / 2.0) * (e2b - 1.0)
-        ) / beta_safe - 1.0  # (D,)
-        t_mid = torch.where(small, torch.tensor(tau_mid, device=beta.device), t_mid)
-        jacobian = torch.exp(-beta_safe.unsqueeze(1) * (t_source - t_mid.unsqueeze(1)))
+        # Jacobian correction: exp(-β · (t(τ) - t(τ=0)))
+        # [Fix #4: use analytical t(0) instead of discrete midpoint]
+        # t(τ=0) = ln[1 + 0.5·(exp(2β)-1)] / β - 1
+        t_at_zero = torch.log(1.0 + 0.5 * (e2b - 1.0)) / beta_safe - 1.0
+        t_at_zero = torch.where(small, torch.zeros_like(t_at_zero), t_at_zero)
+        jacobian = torch.exp(-beta_safe.unsqueeze(1) * (t_source - t_at_zero.unsqueeze(1)))
         jacobian = torch.where(small.unsqueeze(1), torch.ones_like(jacobian), jacobian)
 
-        # Map source positions to index space [0, k-1] on the original grid
+        # Map source positions to index space on the original k-sample grid
         # n(t) = k/2 · (t + 1)
         idx = (k / 2.0) * (t_source + 1.0)  # (D, k_tau)
         idx_lo = idx.long().clamp(0, k - 2)
         idx_hi = idx_lo + 1
         frac = idx - idx_lo.float()
 
-        # Expand windowed (B, W, k) -> (D, B, W, k_tau) for gathering
+        return {
+            'D': D, 'k_tau': k_tau, 'small': small,
+            'idx_lo': idx_lo, 'idx_hi': idx_hi, 'frac': frac,
+            'jacobian': jacobian,
+        }
+
+    def _apply_warp(self, windowed: torch.Tensor, grid: dict) -> torch.Tensor:
+        """Apply precomputed warp grid to windowed signal.
+
+        Parameters
+        ----------
+        windowed : Tensor, shape (B, W, k)
+        grid : dict from _compute_warp_grid
+
+        Returns
+        -------
+        resampled : Tensor, shape (D, B, W, k_tau)
+        """
+        D = grid['D']
+        k_tau = grid['k_tau']
+        B, W, _ = windowed.shape
+
         windowed_exp = windowed.unsqueeze(0).expand(D, -1, -1, -1)
-        idx_lo_exp = idx_lo[:, None, None, :].expand(D, windowed.shape[0], windowed.shape[1], k_tau)
-        idx_hi_exp = idx_hi[:, None, None, :].expand_as(idx_lo_exp)
-        frac_exp = frac[:, None, None, :]
+        idx_lo_exp = grid['idx_lo'][:, None, None, :].expand(D, B, W, k_tau)
+        idx_hi_exp = grid['idx_hi'][:, None, None, :].expand(D, B, W, k_tau)
+        frac_exp = grid['frac'][:, None, None, :]
 
         lo_vals = torch.gather(windowed_exp, 3, idx_lo_exp)
         hi_vals = torch.gather(windowed_exp, 3, idx_hi_exp)
         resampled = lo_vals * (1.0 - frac_exp) + hi_vals * frac_exp
 
         # Apply Jacobian correction
-        resampled = resampled * jacobian[:, None, None, :]
+        resampled = resampled * grid['jacobian'][:, None, None, :]
 
         return resampled
 
@@ -200,44 +208,53 @@ class PeakFinder(nn.Module):
 
     Parameters
     ----------
-    k : int
-        Window size (must match the DechirpSTFT that produced the input).
-        Must be a multiple of 4.
-    R : int
-        Warp resolution (must match DechirpSTFT).
+    stft : DechirpSTFT
+        The STFT instance that produced the input.  PeakFinder reads
+        k, R, Fk, and window buffers from this reference.
     correct_parabolic : bool
         Apply Hann-window parabolic interpolation bias correction (default True).
     correct_scalloping : bool
         Apply scalloping loss correction for boundary amplitude recovery (default True).
     """
 
-    def __init__(self, k: int, R: int = 1, correct_parabolic: bool = True,
+    def __init__(self, stft: DechirpSTFT, correct_parabolic: bool = True,
                  correct_scalloping: bool = True):
         super().__init__()
-        assert k % 4 == 0, f"k must be a multiple of 4, got {k}"
-        self.k = k
-        self.R = R
-        self.k_tau = R * k
-        self.Fk = R * k // 2 + 1
+        # [Fix #1/#3: take DechirpSTFT reference, eliminate parameter duplication]
+        self.stft = stft
         self.correct_parabolic = correct_parabolic
         self.correct_scalloping = correct_scalloping
 
-        self._init_amplitude_unmix(k)
+        k = stft.k
+        self._init_amplitude_unmix(stft)
         if correct_scalloping:
             self._init_scalloping_lut(k)
         if correct_parabolic:
             self._init_parabolic_lut(k)
 
-    def _init_amplitude_unmix(self, k: int):
+    @property
+    def k(self):
+        return self.stft.k
+
+    @property
+    def R(self):
+        return self.stft.R
+
+    @property
+    def Fk(self):
+        return self.stft.Fk
+
+    def _init_amplitude_unmix(self, stft: DechirpSTFT):
         """Precompute the 2x2 mixing matrix inverse for boundary amplitudes.
 
+        Reuses window buffers from the DechirpSTFT to avoid duplication.
         Linear amplitude model A(t) = A_start·(½-t) + A_end·(½+t),
         evaluated at the token boundaries t = ±½.
         """
-        t = 2 * torch.arange(k, dtype=torch.float32) / k - 1
-        window = torch.hann_window(k, periodic=True)
-        window_start = ((1 - t) / 2) * window
-        window_end = ((1 + t) / 2) * window
+        # [Fix #3: reuse window buffers from stft instead of recomputing]
+        t = _make_t_grid(stft.k)
+        window_start = stft.window_start.detach().cpu()
+        window_end = stft.window_end.detach().cpu()
         basis_start = 0.5 - t
         basis_end = 0.5 + t
         M = torch.tensor([
@@ -247,16 +264,11 @@ class PeakFinder(nn.Module):
         self.register_buffer("amp_unmix", torch.linalg.inv(M))
 
     def _init_scalloping_lut(self, k: int):
-        """Precompute scalloping correction lookup table for weighted windows.
-
-        At fractional bin offset delta, the FFT magnitude is reduced by
-        |DTFT(w, delta)| / |DTFT(w, 0)|.  We store the inverse of this
-        ratio on a dense grid for fast interpolation at runtime.
-        """
+        """Precompute scalloping correction lookup table for weighted windows."""
         n_lut = 64
         ns = torch.arange(k, dtype=torch.float64)
         delta_lut = torch.linspace(0, 0.5, n_lut)
-        t = 2 * torch.arange(k, dtype=torch.float64) / k - 1
+        t = _make_t_grid(k, dtype=torch.float64)
         w_ref = ((1 - t) / 2 * torch.hann_window(k, periodic=True).double())
         dtft_mag = torch.zeros(n_lut)
         for i, d in enumerate(delta_lut):
@@ -266,13 +278,7 @@ class PeakFinder(nn.Module):
         self.register_buffer("_scallop_lut", scallop_lut.float())
 
     def _init_parabolic_lut(self, k: int):
-        """Precompute parabolic interpolation correction LUT.
-
-        Parabolic interpolation on Hann-windowed data systematically
-        underestimates fractional bin offsets.  We precompute the exact
-        forward mapping true_delta -> para_delta using the known Hann DTFT,
-        then store the inverse for runtime correction.
-        """
+        """Precompute parabolic interpolation correction LUT."""
         n_corr = 1000
         ns = torch.arange(k, dtype=torch.float64)
         true_d = torch.linspace(0, 0.5, n_corr, dtype=torch.float64)
@@ -286,13 +292,27 @@ class PeakFinder(nn.Module):
             ym, y0, yp = mags
             denom = ym - 2.0 * y0 + yp
             para_d[i] = 0.5 * (ym - yp) / denom if denom.abs() > 1e-12 else 0.0
+        # [Fix #8: use module-level numpy import]
         n_inv = 64
         para_grid = torch.linspace(0, 0.5, n_inv, dtype=torch.float64)
-        import numpy as _np
-        true_inv = _np.interp(
+        true_inv = np.interp(
             para_grid.numpy(), para_d.numpy(), true_d.numpy())
         self.register_buffer(
             "_para_corr_lut", torch.from_numpy(true_inv).float())
+
+    @staticmethod
+    def _unravel_peaks(peaks: torch.Tensor):
+        """Destructure peaks tensor into (dlnf_idx, freq_idx).
+
+        Parameters
+        ----------
+        peaks : LongTensor, shape (B, W, K, 2) or (BW, K, 2)
+
+        Returns
+        -------
+        dlnf_idx, freq_idx : LongTensor
+        """
+        return peaks[..., 0], peaks[..., 1]
 
     def find_peaks(self, X: torch.Tensor, K: int, dlnf_grid: torch.Tensor,
                    radius: int = 2,
@@ -349,10 +369,9 @@ class PeakFinder(nn.Module):
         # --- Parabolic interpolation along frequency axis ---
         fi = freq_idx.clamp(1, Fk - 2)
         f_flat_m = dlnf_idx * Fk + (fi - 1)
-        f_flat_0 = dlnf_idx * Fk + fi
         f_flat_p = dlnf_idx * Fk + (fi + 1)
         yf_m = amp_2d.gather(1, f_flat_m)
-        yf_0 = amp_2d.gather(1, f_flat_0)
+        yf_0 = amp_2d.gather(1, dlnf_idx * Fk + fi)
         yf_p = amp_2d.gather(1, f_flat_p)
 
         f_denom = yf_m - 2.0 * yf_0 + yf_p
@@ -366,19 +385,23 @@ class PeakFinder(nn.Module):
         # --- Parabolic interpolation along dlnf axis ---
         di = dlnf_idx.clamp(1, D - 2)
         d_flat_m = (di - 1) * Fk + freq_idx
-        d_flat_0 = di * Fk + freq_idx
         d_flat_p = (di + 1) * Fk + freq_idx
         yd_m = amp_2d.gather(1, d_flat_m)
-        yd_0 = amp_2d.gather(1, d_flat_0)
+        yd_0 = amp_2d.gather(1, di * Fk + freq_idx)
         yd_p = amp_2d.gather(1, d_flat_p)
 
         d_denom = yd_m - 2.0 * yd_0 + yd_p
         d_delta = 0.5 * (yd_m - yd_p) / d_denom
         d_delta = torch.where(d_denom.abs() < 1e-12, torch.zeros_like(d_delta), d_delta)
         d_delta = d_delta.clamp(-0.5, 0.5)
+        # Zero out delta where dlnf_idx was at the boundary (parabolic is unreliable)
+        at_boundary = (dlnf_idx <= 0) | (dlnf_idx >= D - 1)
+        d_delta = torch.where(at_boundary, torch.zeros_like(d_delta), d_delta)
 
         dlnf_step = dlnf_grid[1] - dlnf_grid[0] if D > 1 else torch.ones(1, device=X.device)
-        dlnf_refined = dlnf_grid[di] + d_delta * dlnf_step
+        # Use the original dlnf_idx for the base value (not clamped di)
+        # so boundary peaks get the correct grid value.
+        dlnf_refined = dlnf_grid[dlnf_idx] + d_delta * dlnf_step
 
         peaks = peaks.reshape(B, W, K, 2)
         freq_refined = freq_refined.reshape(B, W, K)
@@ -387,19 +410,10 @@ class PeakFinder(nn.Module):
 
         return peaks, freq_refined, dlnf_refined, topk_vals
 
-    def _forward_warp(self, t: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    def _forward_warp(self, t, beta: torch.Tensor) -> torch.Tensor:
         """Forward warp τ(t) for given physical time t and chirp rate β.
 
         τ(t) = [exp(β·t) - exp(-β)] / sinh(β) - 1
-
-        Parameters
-        ----------
-        t : float or Tensor
-        beta : Tensor, shape (BW, K)
-
-        Returns
-        -------
-        tau : Tensor, same shape as beta
         """
         small = beta.abs() < 1e-8
         beta_safe = torch.where(small, torch.ones_like(beta), beta)
@@ -424,6 +438,7 @@ class PeakFinder(nn.Module):
         peaks : LongTensor, shape (B, N_WINDOWS, K, 2)
         freq_refined : Tensor, shape (B, N_WINDOWS, K)
         dlnf_refined : Tensor, shape (B, N_WINDOWS, K)
+            Parabolic-refined dlnf value (used for phase propagation).
         dlnf_grid : Tensor, shape (D,)
 
         Returns
@@ -437,8 +452,8 @@ class PeakFinder(nn.Module):
         K = peaks.shape[2]
         R = self.R
 
-        dlnf_idx = peaks.reshape(B * W, K, 2)[:, :, 0]
-        freq_idx = peaks.reshape(B * W, K, 2)[:, :, 1]
+        peaks_flat = peaks.reshape(B * W, K, 2)
+        dlnf_idx, freq_idx = self._unravel_peaks(peaks_flat)
         freq_ref = freq_refined.reshape(B * W, K)
 
         Xp = X.reshape(B * W, D * Fk)
@@ -449,12 +464,12 @@ class PeakFinder(nn.Module):
         # φ_center = arg(X[m]) + π·m/R
         phi_center = X_peak.angle() + torch.pi * freq_idx.float() / R
 
+        # [Fix #2: use dlnf_refined instead of dlnf_grid[dlnf_idx]]
+        # The refined value gives more accurate phase propagation.
+        beta = 2.0 * dlnf_refined.reshape(B * W, K)
+
         # Propagate to token boundaries via forward warp.
         # Phase advance: φ(τ) = φ_center + π·f_ref·τ
-        # (since n(τ)-n(0) = k/2·τ, and advance = 2π·f_ref·(k/2·τ)/k = π·f_ref·τ)
-        dlnf_applied = dlnf_grid[dlnf_idx]
-        beta = 2.0 * dlnf_applied
-
         tau_start = self._forward_warp(-0.5, beta)
         tau_end = self._forward_warp(0.5, beta)
 
@@ -485,8 +500,8 @@ class PeakFinder(nn.Module):
         B, W, D, Fk = X_start.shape
         K = peaks.shape[2]
 
-        dlnf_idx = peaks.reshape(B * W, K, 2)[:, :, 0]
-        freq_idx = peaks.reshape(B * W, K, 2)[:, :, 1]
+        peaks_flat = peaks.reshape(B * W, K, 2)
+        dlnf_idx, freq_idx = self._unravel_peaks(peaks_flat)
 
         amp_s = X_start.abs().reshape(B * W, D * Fk)
         amp_e = X_end.abs().reshape(B * W, D * Fk)
@@ -628,7 +643,7 @@ class ChirpTokenizer(nn.Module):
                  noise_model: 'NoiseModel | None' = None):
         super().__init__()
         self.stft = DechirpSTFT(k=k, R=R)
-        self.peak_finder = PeakFinder(k=k, R=R)
+        self.peak_finder = PeakFinder(stft=self.stft)
         self.noise_model = noise_model
         self.n_peaks = n_peaks
         self.radius = radius

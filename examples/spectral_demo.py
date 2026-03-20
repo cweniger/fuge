@@ -29,7 +29,7 @@ if __name__ == "__main__":
 
     k = 4096
     decomposer = DechirpSTFT(k=k).to(device)
-    peak_finder = PeakFinder(k=k).to(device)
+    peak_finder = PeakFinder(stft=decomposer).to(device)
     noise_rms = np.sqrt(k * 3.0 / 8.0)
 
     # --- dlnf grid hyperparameters ---
