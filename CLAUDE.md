@@ -52,13 +52,13 @@ Four classes with separated concerns. See `docs/spectral_math.md` for the full m
 
 - **`NoiseModel(nn.Module)`**: Streaming noise PSD estimator. Holds a reference to a `DechirpSTFT`, maintains EMA-updated noise std per (window, freq) bin from pure noise signals. Provides `whiten()` for SNR-based peak detection.
 
-- **`ChirpTokenizer(nn.Module)`** (was `ToneTokenizer`): Thin orchestrator composing `DechirpSTFT`, `PeakFinder`, and optionally `NoiseModel`. Outputs 9-field chirp tokens: `[snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end]` with normalized frequencies and wrapped phases. Adjacent tokens share boundaries for voice formation.
+- **`ChirpTokenizer(nn.Module)`**: Thin orchestrator composing `DechirpSTFT`, `PeakFinder`, and optionally `NoiseModel`. Outputs 9-field chirp tokens: `[snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end]` with normalized frequencies and wrapped phases. Adjacent tokens share boundaries for voice formation.
 
 The `dlnf` parameter is per-hop; `β = 2·dlnf` is the total log-frequency change across the full window. Resampling uses linear interpolation on an exponentially warped time grid: `τ(t) = [exp(β·t) − exp(−β)] / sinh(β) − 1`. |dlnf| ≤ 0.5 supported.
 
 ### `src/fuge/spectral/embedding.py` — `ChirpTokenEmbedding(nn.Module)`
 
-Transforms raw chirp tokens (snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end) into model-ready embedded features with z-score normalization. SNR is peak amplitude from the (optionally whitened) STFT. Time and frequency boundaries tile the signal; boundary amplitudes are recovered via weighted FFTs with complementary time weights. (Was `ToneTokenEmbedding`; old name still available as alias.)
+Transforms raw chirp tokens (snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end) into model-ready embedded features with z-score normalization. SNR is peak amplitude from the (optionally whitened) STFT. Time and frequency boundaries tile the signal; boundary amplitudes are recovered via weighted FFTs with complementary time weights. (Was `ToneTokenEmbedding`.)
 
 ### `src/fuge/svd/core.py` — `StreamingPCA(nn.Module)`
 

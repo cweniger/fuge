@@ -26,7 +26,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 sys.path.insert(0, ".")
-from fuge.spectral import ToneTokenizer
+from fuge.spectral import ChirpTokenizer
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 8192
@@ -89,7 +89,7 @@ def tokenize_multi(signal, k_values, n_peaks, n_dlnf, dlnf_min, dlnf_max,
     x = torch.from_numpy(signal).unsqueeze(0)
     tokens_by_k = {}
     for k in k_values:
-        tokenizer = ToneTokenizer(
+        tokenizer = ChirpTokenizer(
             k=k, n_peaks=n_peaks, n_dlnf=n_dlnf,
             dlnf_min=dlnf_min, dlnf_max=dlnf_max,
         ).double()

@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-from fuge.spectral import ToneTokenizer, ToneTokenEmbedding, NoiseModel, DechirpSTFT
+from fuge.spectral import ChirpTokenizer, ChirpTokenEmbedding, NoiseModel, DechirpSTFT
 from fuge.nn import TransformerEmbedding
 
 # ── Signal parameters ────────────────────────────────────────────────
@@ -328,7 +328,7 @@ def evaluate(model, val_loader, device):
 
 def build_and_train(train_tokens, val_tokens, train_params, val_params,
                     device, label):
-    token_emb = ToneTokenEmbedding(phase_mode=PHASE_MODE).double().to(device)
+    token_emb = ChirpTokenEmbedding(phase_mode=PHASE_MODE).double().to(device)
     token_emb.compute_normalization(train_tokens)
 
     train_targets = torch.from_numpy(
@@ -518,7 +518,7 @@ if __name__ == "__main__":
     val_colored = val_signals + val_noise_c
 
     # ── 4. Build tokenizers ──────────────────────────────────────────
-    tok_plain = ToneTokenizer(
+    tok_plain = ChirpTokenizer(
         k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double().to(device)
@@ -534,7 +534,7 @@ if __name__ == "__main__":
     print(f"  noise_std shape: {noise_model.noise_std.shape}")
     print(f"  noise_std range: [{noise_model.noise_std.min():.2e}, {noise_model.noise_std.max():.2e}]")
 
-    tok_psd = ToneTokenizer(
+    tok_psd = ChirpTokenizer(
         k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
         noise_model=noise_model,

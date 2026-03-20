@@ -583,8 +583,6 @@ class NoiseModel(nn.Module):
         return X * scale.unsqueeze(0).unsqueeze(2)
 
 
-# --- Chirp tokenizer (renamed from ToneTokenizer) ---
-
 class ChirpTokenizer(nn.Module):
     """Tokenize time-domain signals into chirp tokens.
 
@@ -705,7 +703,3 @@ class ChirpTokenizer(nn.Module):
             [snr, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe], dim=-1)
 
         return tokens
-
-
-# Backwards compatibility alias
-ToneTokenizer = ChirpTokenizer

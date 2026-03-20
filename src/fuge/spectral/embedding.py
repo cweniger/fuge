@@ -102,7 +102,3 @@ class ChirpTokenEmbedding(nn.Module):
         embedded = self._embed(raw_tokens)
         normalized = (embedded - self.mean) / self.std
         return normalized.reshape(B, W * K, self.n_embed), W, K
-
-
-# Backwards compatibility alias
-ToneTokenEmbedding = ChirpTokenEmbedding
