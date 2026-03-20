@@ -6,9 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Scientific signal embeddings toolkit, installable as the `fuge` Python package. Modular architecture supports multiple embedding types (spectral, streaming SVD, etc.) with shared neural network infrastructure.
 
-- **`src/fuge/spectral/`** — Spectral analysis subpackage: STFT with de-chirping, tokenization, and spectral token embedding
+- **`src/fuge/spectral/`** — Spectral analysis subpackage: STFT with de-chirping, chirp tokenization, and chirp token embedding
 - **`src/fuge/svd/`** — Streaming PCA with Procrustes-stabilized output (StreamingPCA)
 - **`src/fuge/nn.py`** — Generic neural network building blocks (TransformerEmbedding)
+- **`docs/spectral_math.md`** — Mathematical reference for the chirp tokenization pipeline
 
 ## Installation
 
@@ -37,23 +38,27 @@ There is no formal test suite. Demo scripts live in `examples/`. No build system
 
 **Modular embedding design:** Each embedding type lives in its own subpackage under `src/fuge/`. Generic neural network components (e.g. `TransformerEmbedding`) live in `src/fuge/nn.py` and accept pre-embedded tensors of any `d_in` dimension. Import via explicit subpackage: `fuge.spectral.*`, `fuge.svd.*`, `fuge.nn.*`.
 
-### `src/fuge/spectral/core.py` — `DechirpSTFT`, `PeakFinder`, `NoiseModel`, `ToneTokenizer`
+**Terminology:** The tokenizer extracts **chirp tokens** — short spectral components with frequency, amplitude, and phase at window boundaries. Phase-coherent sequences of chirp tokens stitched across windows form **voices**. The full set of voices in a signal is the **choir**. (The package name `fuge` alludes to the musical fugue.)
 
-Four classes with separated concerns:
+### `src/fuge/spectral/core.py` — `DechirpSTFT`, `PeakFinder`, `NoiseModel`, `ChirpTokenizer`
 
-- **`DechirpSTFT(nn.Module)`**: STFT with half-overlapping Hann windows (hop = k/2). De-chirps via resampling (`dlnf`, warps time grid for constant relative chirp rate `f(t) = f_center * exp(dlnf * t/hop)`). With `n_hann_splits=2`, returns boundary FFTs `(X_start, X_end)` from `(1-t)*hann` and `t*hann` windows for amplitude estimation; standard FFT is `X = X_start + X_end`. Input: `(N,)` or `(B, N)` tensor. Output: complex `(N_WINDOWS, k)` tensor.
+Four classes with separated concerns. See `docs/spectral_math.md` for the full mathematical reference.
 
-- **`PeakFinder(nn.Module)`**: Finds top-K peaks in the (dlnf, freq) plane via max-pool suppression, refines positions via parabolic interpolation (with Hann bias correction), extracts phases at half-window boundaries (with dechirp-aware warping), and recovers boundary amplitudes from weighted FFTs (with scalloping correction and mixing matrix inversion).
+**Coordinate convention:** `t ∈ [-1, 1]` across each window, with `n(t) = k/2 · (t + 1)`. Discrete samples at `t_n = 2n/k - 1`. Token boundaries at `t = ±½` (samples k/4 and 3k/4). Periodic Hann window with zero at n=0, peak at n=k/2. Requires `k % 4 == 0`.
+
+- **`DechirpSTFT(nn.Module)`**: STFT with half-overlapping periodic Hann windows (hop = k/2). De-chirps via resampling with Jacobian correction (`β = 2·dlnf`, warps time grid for constant relative chirp rate `f(t) = f_center · exp(β·t)`). Supports warp resolution `R` for finer frequency bins (`Fk = R·k//2 + 1`). With `n_hann_splits=2`, returns boundary FFTs `(X_start, X_end)` from `((1-t)/2)·hann` and `((1+t)/2)·hann` weighted sub-windows; standard FFT is `X = X_start + X_end`. Input: `(B, N)` tensor. Output: complex `(B, N_WINDOWS, D, Fk)` tensor.
+
+- **`PeakFinder(nn.Module)`**: Finds top-K peaks in the (dlnf, freq) plane via max-pool suppression, refines positions via parabolic interpolation (with Hann bias correction), extracts phases at token boundaries t = ±½ using the periodic Hann phase anchor (`φ_center = arg(X[m]) + π·m/R`, exact and δ-independent) with forward-warp propagation, and recovers boundary amplitudes from weighted FFTs (with scalloping correction and mixing matrix inversion).
 
 - **`NoiseModel(nn.Module)`**: Streaming noise PSD estimator. Holds a reference to a `DechirpSTFT`, maintains EMA-updated noise std per (window, freq) bin from pure noise signals. Provides `whiten()` for SNR-based peak detection.
 
-- **`ToneTokenizer(nn.Module)`**: Thin orchestrator composing `DechirpSTFT`, `PeakFinder`, and optionally `NoiseModel`. Outputs 9-field tokens: `[snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end]` with normalized frequencies and wrapped phases.
+- **`ChirpTokenizer(nn.Module)`** (was `ToneTokenizer`): Thin orchestrator composing `DechirpSTFT`, `PeakFinder`, and optionally `NoiseModel`. Outputs 9-field chirp tokens: `[snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end]` with normalized frequencies and wrapped phases. Adjacent tokens share boundaries for voice formation.
 
-The `dlnf` parameter is per-hop and internally scaled by 2 for the full window. Resampling uses linear interpolation on an exponentially warped time grid: `τ(t) = (exp(βt) - 1) / (exp(β) - 1)`.
+The `dlnf` parameter is per-hop; `β = 2·dlnf` is the total log-frequency change across the full window. Resampling uses linear interpolation on an exponentially warped time grid: `τ(t) = [exp(β·t) − exp(−β)] / sinh(β) − 1`. |dlnf| ≤ 0.5 supported.
 
-### `src/fuge/spectral/embedding.py` — `ToneTokenEmbedding(nn.Module)`
+### `src/fuge/spectral/embedding.py` — `ChirpTokenEmbedding(nn.Module)`
 
-Transforms raw tone tokens (snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end) into model-ready embedded features with z-score normalization. SNR is peak amplitude from the (optionally whitened) STFT. Time and frequency boundaries tile the signal; boundary amplitudes are recovered via weighted FFTs with complementary time weights.
+Transforms raw chirp tokens (snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end) into model-ready embedded features with z-score normalization. SNR is peak amplitude from the (optionally whitened) STFT. Time and frequency boundaries tile the signal; boundary amplitudes are recovered via weighted FFTs with complementary time weights. (Was `ToneTokenEmbedding`; old name still available as alias.)
 
 ### `src/fuge/svd/core.py` — `StreamingPCA(nn.Module)`
 
@@ -71,14 +76,17 @@ fuge/
 ├── CLAUDE.md
 ├── LICENSE
 ├── .gitignore
+├── docs/
+│   ├── spectral_math.md         # mathematical reference for chirp tokenization
+│   └── PLAN.md                  # implementation plan (may be outdated)
 ├── src/
 │   └── fuge/
 │       ├── __init__.py              # package docstring, no flat re-exports
 │       ├── nn.py                    # TransformerEmbedding (generic)
 │       ├── spectral/
-│       │   ├── __init__.py          # re-exports: DechirpSTFT, PeakFinder, NoiseModel, ToneTokenizer, ToneTokenEmbedding
-│       │   ├── core.py              # DechirpSTFT, PeakFinder, NoiseModel, ToneTokenizer
-│       │   └── embedding.py         # ToneTokenEmbedding
+│       │   ├── __init__.py          # re-exports: DechirpSTFT, PeakFinder, NoiseModel, ChirpTokenizer, ChirpTokenEmbedding
+│       │   ├── core.py              # DechirpSTFT, PeakFinder, NoiseModel, ChirpTokenizer
+│       │   └── embedding.py         # ChirpTokenEmbedding
 │       └── svd/
 │           ├── __init__.py          # re-exports: StreamingPCA
 │           └── core.py              # StreamingPCA

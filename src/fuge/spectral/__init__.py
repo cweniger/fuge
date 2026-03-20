@@ -1,9 +1,14 @@
 """Spectral signal analysis: STFT, peak finding, noise estimation, tokenization."""
 
-from fuge.spectral.core import DechirpSTFT, PeakFinder, NoiseModel, ToneTokenizer
-from fuge.spectral.embedding import ToneTokenEmbedding
+from fuge.spectral.core import (
+    DechirpSTFT, PeakFinder, NoiseModel,
+    ChirpTokenizer, ToneTokenizer,
+)
+from fuge.spectral.embedding import ChirpTokenEmbedding, ToneTokenEmbedding
 
 __all__ = [
-    "DechirpSTFT", "PeakFinder", "NoiseModel", "ToneTokenizer",
-    "ToneTokenEmbedding",
+    "DechirpSTFT", "PeakFinder", "NoiseModel",
+    "ChirpTokenizer", "ChirpTokenEmbedding",
+    # Backwards compatibility
+    "ToneTokenizer", "ToneTokenEmbedding",
 ]

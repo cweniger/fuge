@@ -2,10 +2,17 @@
 
 Classes
 -------
-DechirpSTFT   — STFT with half-overlapping Hann windows and resample de-chirping.
-PeakFinder    — Find and characterize spectral peaks (frequency, phase, amplitude).
-NoiseModel    — Streaming noise PSD estimator for whitening.
-ToneTokenizer — Orchestrates STFT → whitening → peak finding → token output.
+DechirpSTFT      — STFT with half-overlapping Hann windows and resample de-chirping.
+PeakFinder       — Find and characterize spectral peaks (frequency, phase, amplitude).
+NoiseModel       — Streaming noise PSD estimator for whitening.
+ChirpTokenizer   — Orchestrates STFT → whitening → peak finding → token output.
+
+Coordinate convention (see docs/spectral_math.md):
+    t ∈ [-1, 1] across the window, n(t) = k/2 · (t + 1).
+    Discrete samples: t_n = 2n/k - 1 for n = 0, …, k-1.
+    Token boundaries at t = ±½ → samples k/4 and 3k/4.
+    Periodic Hann window: zero at n=0, peak at n=k/2.
+    β = 2·dlnf (total log-frequency change across the full window).
 """
 
 import torch
@@ -19,34 +26,39 @@ class DechirpSTFT(nn.Module):
     Parameters
     ----------
     k : int
-        Window size in bins.  Also the FFT size per window.
+        Window size in samples.  Must be a multiple of 4.
+    R : int
+        Warp resolution: the τ-grid has R·k samples, giving R·k/2+1
+        frequency bins.  Default 1 (no extra resolution).
 
-    Output shape: (B, N_WINDOWS, k)  -- complex-valued.
-    N_WINDOWS = (N - k) // (k // 2) + 1   (with hop = k // 2).
+    Output shape: (B, N_WINDOWS, D, Fk) complex-valued,
+    where Fk = R·k // 2 + 1.
+    N_WINDOWS = (N - k) // (k // 2) + 1  (with hop = k // 2).
     """
 
-    def __init__(self, k: int):
+    def __init__(self, k: int, R: int = 1):
         super().__init__()
+        assert k % 4 == 0, f"k must be a multiple of 4, got {k}"
         self.k = k
         self.hop = k // 2
-        self.Fk = k // 2 + 1
-        self.register_buffer("window", torch.hann_window(k))
+        self.R = R
+        self.k_tau = R * k
+        self.Fk = R * k // 2 + 1
+        self.register_buffer("window", torch.hann_window(k, periodic=True))
 
-        # Weighted windows for amplitude-at-boundary estimation:
-        # (1-t)*hann and t*hann, where t in [0, 1] across the window
-        # (t=0 at window start, t=1 at window end).
-        # Note: window = window_start + window_end by construction.
-        t_unit = torch.linspace(0, 1, k)
-        self.register_buffer("window_start", (1 - t_unit) * self.window)
-        self.register_buffer("window_end", t_unit * self.window)
+        # Weighted sub-windows for boundary amplitude estimation.
+        # t ∈ [-1, 1] across the window; w_start = ((1-t)/2)·hann,
+        # w_end = ((1+t)/2)·hann.  w_start + w_end = hann.
+        t = 2 * torch.arange(k, dtype=torch.float32) / k - 1  # t_n = 2n/k - 1
+        self.register_buffer("window_start", ((1 - t) / 2) * self.window)
+        self.register_buffer("window_end", ((1 + t) / 2) * self.window)
 
     def forward(self, x: torch.Tensor, dlnf: torch.Tensor = None,
                 n_hann_splits: int = 1):
         """Compute the de-chirped windowed FFT.
 
-        The de-chirp model assumes each tone has constant relative chirp
-        rate within a window: f(t) = f_center * exp(dlnf * (t - t_center) / hop),
-        where dlnf = d(ln f)/d(hop) is dimensionless.
+        The chirp model is f(t) = f_center · exp(β·t) with t ∈ [-1, 1]
+        and β = 2·dlnf.
 
         Parameters
         ----------
@@ -54,25 +66,26 @@ class DechirpSTFT(nn.Module):
             Batched time-domain signals.
         dlnf : Tensor of shape (D,), or None
             Relative chirp parameter: change in ln(f) per hop step,
-            i.e. dlnf = (fdot/f) * T_hop  (dimensionless).
+            i.e. dlnf = (fdot/f) · T_hop  (dimensionless).
+            |dlnf| ≤ 0.5 supported (linear interpolation adequate).
             Computes the STFT for each value in parallel; output has a
             leading D dimension.  Default None is equivalent to [0.].
         n_hann_splits : int
-            Number of temporal sub-windows to split the Hann window into.
             1 (default): return the standard Hann-windowed FFT.
-            2: return (X_start, X_end) from (1-t)*hann and t*hann windows
-               (t in [0,1] across the window).  The standard Hann FFT can
-               be recovered as X = X_start + X_end.
+            2: return (X_start, X_end) from weighted sub-windows.
 
         Returns
         -------
         X : complex Tensor, shape (B, N_WINDOWS, D, Fk) (if n_hann_splits=1)
-            Fk = k // 2 + 1 positive-frequency bins (via rfft).
+            Fk = R·k // 2 + 1 positive-frequency bins (via rfft).
         (X_start, X_end) : tuple of complex Tensors (if n_hann_splits=2)
             Each has shape (B, N_WINDOWS, D, Fk).
         """
         if dlnf is None:
             dlnf = torch.zeros(1, device=x.device)
+
+        # β = 2·dlnf: total log-frequency change across the full window
+        beta = 2.0 * dlnf
 
         # Unfold into overlapping windows: (B, N_WINDOWS, k)
         raw_windows = x.unfold(dimension=1, size=self.k, step=self.hop)
@@ -89,67 +102,91 @@ class DechirpSTFT(nn.Module):
         for wf in win_funcs:
             windowed = raw_windows * wf
 
-            # --- Relative de-chirp via time-grid resampling ---
-            # dlnf is per hop; full window spans 2 hops
-            windowed = self._resample_dechirp_batched(windowed, 2.0 * dlnf)
-            # _resample produces (D, B, W, k); permute to (B, W, D, k)
-            # so downstream consumers don't need per-method permutations.
+            # Resample via dechirp warp: (B, W, k) -> (D, B, W, k_tau)
+            windowed = self._resample_dechirp_batched(windowed, beta)
+            # Permute to (B, W, D, k_tau)
             windowed = windowed.permute(1, 2, 0, 3)
 
-            results.append(torch.fft.rfft(windowed, n=self.k, dim=-1))
+            results.append(torch.fft.rfft(windowed, n=self.k_tau, dim=-1))
 
         if n_hann_splits == 1:
             return results[0]
         return tuple(results)
 
-    # TODO: upsample via FFT zero-padding before warping (sinc interpolation),
-    # use grid_sample for resampling, and make upsample factor adaptive to
-    # abs(beta) for large dlnf values.
-    def _resample_dechirp_batched(self, windowed: torch.Tensor, betas: torch.Tensor) -> torch.Tensor:
+    def _resample_dechirp_batched(self, windowed: torch.Tensor,
+                                  beta: torch.Tensor) -> torch.Tensor:
         """Resample windowed segments for multiple chirp rates at once.
+
+        Computes the chirped matched filter by resampling (gridding) the
+        windowed signal onto a uniform τ-grid, with Jacobian correction
+        for amplitude fidelity.
 
         Parameters
         ----------
         windowed : Tensor, shape (B, N_WINDOWS, k)
-        betas : Tensor, shape (D,)
-            Total ln(f) change over the full window for each trial.
+        beta : Tensor, shape (D,)
+            β = 2·dlnf, total log-frequency change across the full window.
 
         Returns
         -------
-        resampled : Tensor, shape (D, B, N_WINDOWS, k)
+        resampled : Tensor, shape (D, B, N_WINDOWS, k_tau)
         """
-        D = betas.shape[0]
-        tau_uniform = torch.linspace(0.0, 1.0, self.k, device=windowed.device)  # (k,)
+        D = beta.shape[0]
+        k = self.k
+        k_tau = self.k_tau
+
+        # Destination grid in τ-space: k_tau samples at τ_n = 2n/k_tau - 1
+        tau = (2 * torch.arange(k_tau, device=windowed.device, dtype=torch.float32)
+               / k_tau - 1)  # (k_tau,)
 
         # Replace near-zero betas to avoid division by zero;
         # for |beta| < eps the warped grid is effectively identity.
-        safe = betas.abs() < 1e-8
-        betas_safe = torch.where(safe, torch.ones_like(betas) * 1e-8, betas)
+        small = beta.abs() < 1e-8
+        beta_safe = torch.where(small, torch.ones_like(beta) * 1e-8, beta)
 
-        eb = torch.exp(betas_safe)  # (D,)
-        # Source positions: (D, k)
-        t_source = (2.0 / betas_safe.unsqueeze(1)) * torch.log(
-            1.0 + tau_uniform.unsqueeze(0) * (eb.unsqueeze(1) - 1.0)
-        ) - 1.0
-        # For near-zero betas, use identity grid
-        identity = torch.linspace(-1.0, 1.0, self.k, device=windowed.device)
-        t_source = torch.where(safe.unsqueeze(1), identity.unsqueeze(0), t_source)
+        # Inverse warp: t(τ) = ln[1 + ((τ+1)/2)·(exp(2β)-1)] / β - 1
+        # (see docs/spectral_math.md §3)
+        e2b = torch.exp(2.0 * beta_safe)  # (D,)
+        t_source = torch.log(
+            1.0 + ((tau.unsqueeze(0) + 1.0) / 2.0)
+            * (e2b.unsqueeze(1) - 1.0)
+        ) / beta_safe.unsqueeze(1) - 1.0  # (D, k_tau)
 
-        # Map to index space [0, k-1]
-        idx = (t_source + 1.0) * 0.5 * (self.k - 1)  # (D, k)
-        idx_lo = idx.long().clamp(0, self.k - 2)       # (D, k)
+        # For near-zero beta, use identity grid
+        t_source = torch.where(
+            small.unsqueeze(1),
+            tau.unsqueeze(0),
+            t_source)
+
+        # Jacobian correction: exp(-β · (t(τ) - t(0)))
+        # t(0) for the midpoint of τ-grid: t at τ = 2*(k_tau//2)/k_tau - 1
+        tau_mid = 2.0 * (k_tau // 2) / k_tau - 1.0
+        t_mid = torch.log(
+            1.0 + ((tau_mid + 1.0) / 2.0) * (e2b - 1.0)
+        ) / beta_safe - 1.0  # (D,)
+        t_mid = torch.where(small, torch.tensor(tau_mid, device=beta.device), t_mid)
+        jacobian = torch.exp(-beta_safe.unsqueeze(1) * (t_source - t_mid.unsqueeze(1)))
+        jacobian = torch.where(small.unsqueeze(1), torch.ones_like(jacobian), jacobian)
+
+        # Map source positions to index space [0, k-1] on the original grid
+        # n(t) = k/2 · (t + 1)
+        idx = (k / 2.0) * (t_source + 1.0)  # (D, k_tau)
+        idx_lo = idx.long().clamp(0, k - 2)
         idx_hi = idx_lo + 1
-        frac = (idx - idx_lo.float())                   # (D, k)
+        frac = idx - idx_lo.float()
 
-        # Expand windowed (B, W, k) -> (D, B, W, k) for gathering
+        # Expand windowed (B, W, k) -> (D, B, W, k_tau) for gathering
         windowed_exp = windowed.unsqueeze(0).expand(D, -1, -1, -1)
-        idx_lo_exp = idx_lo[:, None, None, :].expand_as(windowed_exp)
-        idx_hi_exp = idx_hi[:, None, None, :].expand_as(windowed_exp)
-        frac_exp = frac[:, None, None, :]  # broadcasts over B, W
+        idx_lo_exp = idx_lo[:, None, None, :].expand(D, windowed.shape[0], windowed.shape[1], k_tau)
+        idx_hi_exp = idx_hi[:, None, None, :].expand_as(idx_lo_exp)
+        frac_exp = frac[:, None, None, :]
 
         lo_vals = torch.gather(windowed_exp, 3, idx_lo_exp)
         hi_vals = torch.gather(windowed_exp, 3, idx_hi_exp)
         resampled = lo_vals * (1.0 - frac_exp) + hi_vals * frac_exp
+
+        # Apply Jacobian correction
+        resampled = resampled * jacobian[:, None, None, :]
 
         return resampled
 
@@ -165,17 +202,23 @@ class PeakFinder(nn.Module):
     ----------
     k : int
         Window size (must match the DechirpSTFT that produced the input).
+        Must be a multiple of 4.
+    R : int
+        Warp resolution (must match DechirpSTFT).
     correct_parabolic : bool
         Apply Hann-window parabolic interpolation bias correction (default True).
     correct_scalloping : bool
         Apply scalloping loss correction for boundary amplitude recovery (default True).
     """
 
-    def __init__(self, k: int, correct_parabolic: bool = True,
+    def __init__(self, k: int, R: int = 1, correct_parabolic: bool = True,
                  correct_scalloping: bool = True):
         super().__init__()
+        assert k % 4 == 0, f"k must be a multiple of 4, got {k}"
         self.k = k
-        self.Fk = k // 2 + 1
+        self.R = R
+        self.k_tau = R * k
+        self.Fk = R * k // 2 + 1
         self.correct_parabolic = correct_parabolic
         self.correct_scalloping = correct_scalloping
 
@@ -188,16 +231,15 @@ class PeakFinder(nn.Module):
     def _init_amplitude_unmix(self, k: int):
         """Precompute the 2x2 mixing matrix inverse for boundary amplitudes.
 
-        The mixing matrix relates weighted FFT magnitudes to boundary
-        amplitudes, assuming linear amplitude A(t) within the window,
-        where A(t) = A_start*(1-t) + A_end*t, t in [0, 1] across the window.
+        Linear amplitude model A(t) = A_start·(½-t) + A_end·(½+t),
+        evaluated at the token boundaries t = ±½.
         """
-        t_unit = torch.linspace(0, 1, k)
-        window = torch.hann_window(k)
-        window_start = (1 - t_unit) * window
-        window_end = t_unit * window
-        basis_start = 1 - t_unit
-        basis_end = t_unit
+        t = 2 * torch.arange(k, dtype=torch.float32) / k - 1
+        window = torch.hann_window(k, periodic=True)
+        window_start = ((1 - t) / 2) * window
+        window_end = ((1 + t) / 2) * window
+        basis_start = 0.5 - t
+        basis_end = 0.5 + t
         M = torch.tensor([
             [(window_start * basis_start).sum(), (window_start * basis_end).sum()],
             [(window_end * basis_start).sum(), (window_end * basis_end).sum()],
@@ -210,15 +252,12 @@ class PeakFinder(nn.Module):
         At fractional bin offset delta, the FFT magnitude is reduced by
         |DTFT(w, delta)| / |DTFT(w, 0)|.  We store the inverse of this
         ratio on a dense grid for fast interpolation at runtime.
-        w_start and w_end have nearly identical scalloping (verified
-        numerically: ratio differs by < 0.01% at delta=0.5).
         """
-        # TODO: test whether this correction is significant in practice.
-        n_lut = 64  # half-bin resolution: 0 to 0.5
+        n_lut = 64
         ns = torch.arange(k, dtype=torch.float64)
         delta_lut = torch.linspace(0, 0.5, n_lut)
-        t_unit = torch.linspace(0, 1, k)
-        w_ref = ((1 - t_unit) * torch.hann_window(k)).double()
+        t = 2 * torch.arange(k, dtype=torch.float64) / k - 1
+        w_ref = ((1 - t) / 2 * torch.hann_window(k, periodic=True).double())
         dtft_mag = torch.zeros(n_lut)
         for i, d in enumerate(delta_lut):
             phasor = torch.exp(2j * torch.pi * d * ns / k)
@@ -230,15 +269,15 @@ class PeakFinder(nn.Module):
         """Precompute parabolic interpolation correction LUT.
 
         Parabolic interpolation on Hann-windowed data systematically
-        underestimates fractional bin offsets (e.g. true 0.4 -> estimated 0.36).
-        We precompute the exact forward mapping true_delta -> para_delta using
-        the known Hann DTFT, then store the inverse for runtime correction.
+        underestimates fractional bin offsets.  We precompute the exact
+        forward mapping true_delta -> para_delta using the known Hann DTFT,
+        then store the inverse for runtime correction.
         """
-        n_corr = 1000  # dense forward mapping
+        n_corr = 1000
         ns = torch.arange(k, dtype=torch.float64)
         true_d = torch.linspace(0, 0.5, n_corr, dtype=torch.float64)
         para_d = torch.zeros(n_corr, dtype=torch.float64)
-        w_hann = torch.hann_window(k).double()
+        w_hann = torch.hann_window(k, periodic=True).double()
         for i, td in enumerate(true_d):
             mags = []
             for off in [-1, 0, 1]:
@@ -247,7 +286,6 @@ class PeakFinder(nn.Module):
             ym, y0, yp = mags
             denom = ym - 2.0 * y0 + yp
             para_d[i] = 0.5 * (ym - yp) / denom if denom.abs() > 1e-12 else 0.0
-        # Invert: uniform grid over parabolic delta -> true delta
         n_inv = 64
         para_grid = torch.linspace(0, 0.5, n_inv, dtype=torch.float64)
         import numpy as _np
@@ -261,22 +299,14 @@ class PeakFinder(nn.Module):
                    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Find top K peaks in the (dlnf, freq) plane per time window.
 
-        A pixel is a peak iff it equals the max in its (2r+1)x(2r+1)
-        neighborhood (via max-pool), then the K strongest peaks are returned.
-        Both frequency and dlnf positions are refined via parabolic
-        interpolation on the amplitude and its immediate neighbours.
-
         Parameters
         ----------
         X : complex Tensor, shape (B, N_WINDOWS, D, Fk)
-            STFT output from forward() with a 1-D dlnf tensor.
         K : int
             Number of peaks to return per time window.
         dlnf_grid : Tensor, shape (D,)
-            The dlnf values used to produce X (assumed linearly spaced).
         radius : int
-            Suppression radius (default 2): peak must be the maximum in
-            a (2*radius+1) x (2*radius+1) window in the (dlnf, freq) plane.
+            Suppression radius (default 2).
 
         Returns
         -------
@@ -291,38 +321,30 @@ class PeakFinder(nn.Module):
         """
         B, W, D, Fk = X.shape
 
-        # Merge batch and window dims: all ops are per-window
-        amp = X.abs()                      # (B, W, D, Fk)
-        amp = amp.reshape(B * W, D, Fk)   # (BW, D, F)
+        amp = X.abs()
+        amp = amp.reshape(B * W, D, Fk)
         BW = B * W
 
-        # Max pool to find local maxima
         kernel = 2 * radius + 1
-        amp_4d = amp.unsqueeze(1)          # (BW, 1, D, F)
+        amp_4d = amp.unsqueeze(1)
         pooled = F.max_pool2d(amp_4d, kernel_size=kernel, stride=1, padding=radius)
-        is_peak = (amp_4d == pooled).squeeze(1)  # (BW, D, F)
+        is_peak = (amp_4d == pooled).squeeze(1)
 
-        # Collapse duplicate peaks along the dlnf axis: for each frequency
-        # bin, keep only the dlnf index with the highest amplitude.  This
-        # prevents a slowly-chirping signal (flat dlnf response) from
-        # producing multiple peaks at the same frequency.
-        best_d = amp.argmax(dim=1, keepdim=True)  # (BW, 1, Fk)
+        best_d = amp.argmax(dim=1, keepdim=True)
         dlnf_mask = torch.zeros_like(is_peak)
         dlnf_mask.scatter_(1, best_d, 1)
         is_peak = is_peak & dlnf_mask.bool()
 
-        # Keep only peak amplitudes, flatten spatial dims
         amp_peaks = torch.where(is_peak, amp, torch.zeros_like(amp))
-        amp_flat = amp_peaks.reshape(BW, -1)  # (BW, D*F)
+        amp_flat = amp_peaks.reshape(BW, -1)
 
-        topk_vals, topk_idx = amp_flat.topk(K, dim=1)  # (BW, K)
+        topk_vals, topk_idx = amp_flat.topk(K, dim=1)
 
-        # Unravel flat index -> (dlnf_idx, freq_idx)
         dlnf_idx = topk_idx // Fk
         freq_idx = topk_idx % Fk
-        peaks = torch.stack([dlnf_idx, freq_idx], dim=-1)  # (BW, K, 2)
+        peaks = torch.stack([dlnf_idx, freq_idx], dim=-1)
 
-        amp_2d = amp.reshape(BW, -1)  # (BW, D*Fk)
+        amp_2d = amp.reshape(BW, -1)
 
         # --- Parabolic interpolation along frequency axis ---
         fi = freq_idx.clamp(1, Fk - 2)
@@ -358,7 +380,6 @@ class PeakFinder(nn.Module):
         dlnf_step = dlnf_grid[1] - dlnf_grid[0] if D > 1 else torch.ones(1, device=X.device)
         dlnf_refined = dlnf_grid[di] + d_delta * dlnf_step
 
-        # Restore (B, W, ...) shape
         peaks = peaks.reshape(B, W, K, 2)
         freq_refined = freq_refined.reshape(B, W, K)
         dlnf_refined = dlnf_refined.reshape(B, W, K)
@@ -366,87 +387,79 @@ class PeakFinder(nn.Module):
 
         return peaks, freq_refined, dlnf_refined, topk_vals
 
+    def _forward_warp(self, t: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+        """Forward warp τ(t) for given physical time t and chirp rate β.
+
+        τ(t) = [exp(β·t) - exp(-β)] / sinh(β) - 1
+
+        Parameters
+        ----------
+        t : float or Tensor
+        beta : Tensor, shape (BW, K)
+
+        Returns
+        -------
+        tau : Tensor, same shape as beta
+        """
+        small = beta.abs() < 1e-8
+        beta_safe = torch.where(small, torch.ones_like(beta), beta)
+        sinh_b = torch.sinh(beta_safe)
+        tau = (torch.exp(beta_safe * t) - torch.exp(-beta_safe)) / sinh_b - 1.0
+        tau = torch.where(small, torch.full_like(tau, float(t)), tau)
+        return tau
+
     def peak_phases(self, X: torch.Tensor, peaks: torch.Tensor,
                     freq_refined: torch.Tensor, dlnf_refined: torch.Tensor,
                     dlnf_grid: torch.Tensor,
                     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Estimate phase at half-window boundaries for each peak.
+        """Estimate phase at token boundaries (t = ±½) for each peak.
 
-        Returns phase_start and phase_end at the ±0.5 points of the
-        Hann window (samples k/4 and 3k/4).  With 50% overlap,
-        phase_end[w] coincides with phase_start[w+1], so the phases
-        tile the signal without gaps.
-
-        phase_center (at the window midpoint) can be recovered as
-        (phase_start + phase_end) / 2.
+        Uses the periodic Hann phase anchor (§6 of spectral_math.md):
+        φ_center = arg(X[m]) + π·m/R, exact and δ-independent.
+        Then propagates to t = ±½ via the forward warp.
 
         Parameters
         ----------
         X : complex Tensor, shape (B, N_WINDOWS, D, Fk)
         peaks : LongTensor, shape (B, N_WINDOWS, K, 2)
-            Integer (dlnf_idx, freq_idx) from find_peaks.
         freq_refined : Tensor, shape (B, N_WINDOWS, K)
-            Fractional frequency bin index (in de-chirped domain).
         dlnf_refined : Tensor, shape (B, N_WINDOWS, K)
-            Interpolated dlnf value (true chirp rate).
         dlnf_grid : Tensor, shape (D,)
-            The dlnf grid used for de-chirping.
 
         Returns
         -------
         phase_start : Tensor, shape (B, N_WINDOWS, K)
-            Phase at sample k/4 (t = -0.5 in Hann window coords).
+            Phase at t = -½ (token start boundary).
         phase_end : Tensor, shape (B, N_WINDOWS, K)
-            Phase at sample 3k/4 (t = +0.5 in Hann window coords).
-            phase_end[w] = phase_start[w+1] for noiseless signals.
+            Phase at t = +½ (token end boundary).
         """
         B, W, D, Fk = X.shape
         K = peaks.shape[2]
+        R = self.R
 
-        # Flatten batch*window for per-window gather
-        dlnf_idx = peaks.reshape(B * W, K, 2)[:, :, 0]   # (BW, K)
-        freq_idx = peaks.reshape(B * W, K, 2)[:, :, 1]    # (BW, K)
-        freq_ref = freq_refined.reshape(B * W, K)          # (BW, K)
+        dlnf_idx = peaks.reshape(B * W, K, 2)[:, :, 0]
+        freq_idx = peaks.reshape(B * W, K, 2)[:, :, 1]
+        freq_ref = freq_refined.reshape(B * W, K)
 
-        # TODO: investigate whether grid_sample can replace this gather.
-        # Reshape X: (B, W, D, Fk) -> (BW, D*Fk)
         Xp = X.reshape(B * W, D * Fk)
         flat_idx = dlnf_idx * Fk + freq_idx
-        X_peak = Xp.gather(1, flat_idx)  # (BW, K) complex
+        X_peak = Xp.gather(1, flat_idx)
 
-        # Phase at window start (sample 0), corrected for fractional bin offset.
-        f_delta = freq_ref - freq_idx.float()
-        phi_0 = X_peak.angle() - torch.pi * f_delta * (self.k - 1) / self.k
+        # Phase anchor at window center in τ-space (sample k/2):
+        # φ_center = arg(X[m]) + π·m/R
+        phi_center = X_peak.angle() + torch.pi * freq_idx.float() / R
 
-        # Advance to half-window boundaries via the dechirp warping.
-        #
-        # phi_0 is the phase at sample 0, extracted from the dechirped FFT.
-        # In the dechirped domain, the signal is a pure tone at freq_ref,
-        # so the phase at dechirped position tau in [0, 1] is:
-        #   phi_dechirp(tau) = phi_0 + 2*pi * freq_ref * tau
-        #
-        # The dechirp resampling maps original sample position n to
-        # dechirped position:
-        #   tau(n) = (exp(beta * n/k) - 1) / (exp(beta) - 1)
-        # where beta = 2 * dlnf_applied (the grid value used for dechirping).
-        #
-        # For beta -> 0 this reduces to tau = n/k (identity), giving the
-        # linear formula phi_0 + 2*pi*freq*n/k.
-        dlnf_applied = dlnf_grid[dlnf_idx]  # (BW, K) — the actual dechirp used
+        # Propagate to token boundaries via forward warp.
+        # Phase advance: φ(τ) = φ_center + π·f_ref·τ
+        # (since n(τ)-n(0) = k/2·τ, and advance = 2π·f_ref·(k/2·τ)/k = π·f_ref·τ)
+        dlnf_applied = dlnf_grid[dlnf_idx]
         beta = 2.0 * dlnf_applied
-        small = beta.abs() < 1e-8
-        beta_safe = torch.where(small, torch.ones_like(beta), beta)
-        eb = torch.exp(beta_safe)
 
-        def _phase_at(n_frac):
-            """Phase at original sample n_frac * k, via dechirp mapping."""
-            tau = (torch.exp(beta_safe * n_frac) - 1.0) / (eb - 1.0)
-            warped_adv = 2.0 * torch.pi * freq_ref * tau
-            linear_adv = 2.0 * torch.pi * freq_ref * n_frac
-            return torch.where(small, linear_adv, warped_adv)
+        tau_start = self._forward_warp(-0.5, beta)
+        tau_end = self._forward_warp(0.5, beta)
 
-        phase_start = (phi_0 + _phase_at(0.25)).reshape(B, W, K)
-        phase_end = (phi_0 + _phase_at(0.75)).reshape(B, W, K)
+        phase_start = (phi_center + torch.pi * freq_ref * tau_start).reshape(B, W, K)
+        phase_end = (phi_center + torch.pi * freq_ref * tau_end).reshape(B, W, K)
 
         return phase_start, phase_end
 
@@ -456,55 +469,39 @@ class PeakFinder(nn.Module):
         """Extract boundary amplitudes (A_start, A_end) from weighted FFTs.
 
         Uses the precomputed inverse mixing matrix to deconvolve the
-        weighted FFT magnitudes into true boundary amplitudes, assuming
-        linear amplitude variation within each window.  Corrects for
-        Hann-window scalloping loss at fractional frequency bin offsets.
-
-        The output amplitudes are true time-domain amplitudes (the 1/2
-        factor from the cosine→complex exponential decomposition in the
-        FFT is corrected for).
+        weighted FFT magnitudes into true boundary amplitudes at t = ±½.
 
         Parameters
         ----------
         X_start, X_end : complex Tensor, shape (B, N_WINDOWS, D, Fk)
-            Weighted FFTs from forward(..., n_hann_splits=2).
         peaks : LongTensor, shape (B, N_WINDOWS, K, 2)
-            Integer (dlnf_idx, freq_idx) from find_peaks.
         freq_refined : Tensor, shape (B, N_WINDOWS, K)
-            Parabolic-interpolated fractional frequency bin index from
-            find_peaks, used to correct for scalloping loss.
 
         Returns
         -------
         A_start, A_end : Tensor, shape (B, N_WINDOWS, K)
-            Amplitude at window start and end boundaries, clamped >= 0.
+            Amplitude at token boundaries t = ±½, clamped >= 0.
         """
         B, W, D, Fk = X_start.shape
         K = peaks.shape[2]
 
-        # Flatten batch*window for gathering
         dlnf_idx = peaks.reshape(B * W, K, 2)[:, :, 0]
         freq_idx = peaks.reshape(B * W, K, 2)[:, :, 1]
 
-        # Reshape: (B, W, D, Fk) -> (BW, D*Fk)
         amp_s = X_start.abs().reshape(B * W, D * Fk)
         amp_e = X_end.abs().reshape(B * W, D * Fk)
 
-        flat_idx = dlnf_idx * Fk + freq_idx  # (BW, K)
-        mag_s = amp_s.gather(1, flat_idx)  # (BW, K)
-        mag_e = amp_e.gather(1, flat_idx)  # (BW, K)
+        flat_idx = dlnf_idx * Fk + freq_idx
+        mag_s = amp_s.gather(1, flat_idx)
+        mag_e = amp_e.gather(1, flat_idx)
 
-        # Correct for scalloping loss at fractional bin offset
         if self.correct_scalloping:
             delta = freq_refined.reshape(B * W, K) - freq_idx.float()
             scallop_corr = self._scallop_correction(delta)
             mag_s = mag_s * scallop_corr
             mag_e = mag_e * scallop_corr
 
-        # Apply inverse mixing matrix: [A_start, A_end] = amp_unmix @ [mag_s, mag_e]
-        # Then multiply by 2 to correct for the cosine→complex exponential
-        # factor of 1/2 in the FFT magnitudes.
-        M_inv = self.amp_unmix  # (2, 2)
+        M_inv = self.amp_unmix
         A_start = 2.0 * (M_inv[0, 0] * mag_s + M_inv[0, 1] * mag_e)
         A_end = 2.0 * (M_inv[1, 0] * mag_s + M_inv[1, 1] * mag_e)
 
@@ -514,22 +511,8 @@ class PeakFinder(nn.Module):
         return A_start, A_end
 
     def _correct_parabolic(self, delta: torch.Tensor) -> torch.Tensor:
-        """Correct parabolic interpolation bias using precomputed LUT.
-
-        Parabolic interpolation systematically underestimates fractional
-        bin offsets for Hann windows.  This method maps the biased estimate
-        to the true offset using an exact inverse mapping.
-
-        Parameters
-        ----------
-        delta : Tensor
-            Signed parabolic estimate of fractional bin offset.
-
-        Returns
-        -------
-        corrected : Tensor, same shape as delta.
-        """
-        lut = self._para_corr_lut  # (n_inv,) on [0, 0.5]
+        """Correct parabolic interpolation bias using precomputed LUT."""
+        lut = self._para_corr_lut
         n_inv = lut.shape[0]
         sign = delta.sign()
         ad = delta.abs().clamp(max=0.5)
@@ -540,22 +523,9 @@ class PeakFinder(nn.Module):
         return sign * corrected
 
     def _scallop_correction(self, delta: torch.Tensor) -> torch.Tensor:
-        """Look up scalloping correction factor from precomputed table.
-
-        Parameters
-        ----------
-        delta : Tensor
-            Fractional bin offset (signed); only |delta| matters.
-
-        Returns
-        -------
-        correction : Tensor, same shape as delta.
-            Multiply FFT magnitude at integer bin by this to recover
-            the on-bin magnitude.
-        """
-        lut = self._scallop_lut  # (n_lut,) on [0, 0.5]
+        """Look up scalloping correction factor from precomputed table."""
+        lut = self._scallop_lut
         n_lut = lut.shape[0]
-        # Map |delta| to LUT index space [0, n_lut-1]
         t = delta.abs().clamp(max=0.5) * (n_lut - 1) / 0.5
         idx_lo = t.long().clamp(max=n_lut - 2)
         frac = t - idx_lo.float()
@@ -566,8 +536,7 @@ class NoiseModel(nn.Module):
     """Streaming noise PSD estimator for whitening STFT output.
 
     Holds a reference to a DechirpSTFT and maintains a running estimate
-    of the noise standard deviation per (window, frequency) bin.  Feed
-    pure noise via ``update()`` and apply whitening via ``whiten()``.
+    of the noise standard deviation per (window, frequency) bin.
 
     Parameters
     ----------
@@ -587,20 +556,12 @@ class NoiseModel(nn.Module):
     def update(self, x: torch.Tensor) -> None:
         """Update noise std estimate from a batch of pure-noise signals.
 
-        Computes a non-de-chirped STFT and estimates the standard deviation
-        of amplitudes per (window, freq) bin.  On the first call (when
-        ``self.noise_std is None``), the estimate is set directly.  On
-        subsequent calls it is updated via exponential moving average::
-
-            noise_std = momentum * noise_std + (1 - momentum) * std_new
-
         Parameters
         ----------
         x : Tensor, shape (B, N)
-            Batched time-domain signals (pure noise).
         """
-        X = self.stft(x)[:, :, 0, :]                 # (B, W, D=1, Fk) -> (B, W, Fk)
-        std_new = X.abs().std(dim=0)               # (W, Fk)
+        X = self.stft(x)[:, :, 0, :]    # (B, W, D=1, Fk) -> (B, W, Fk)
+        std_new = X.abs().std(dim=0)     # (W, Fk)
 
         if self.noise_std is None:
             self.noise_std = std_new
@@ -618,22 +579,30 @@ class NoiseModel(nn.Module):
         -------
         X_w : complex Tensor, same shape as X.
         """
-        # noise_std: (W, Fk) -> (1, W, 1, Fk) for broadcasting
         scale = 1.0 / self.noise_std.clamp(min=1e-12)
         return X * scale.unsqueeze(0).unsqueeze(2)
 
 
-class ToneTokenizer(nn.Module):
-    """Tokenize time-domain signals into spectral peak features.
+# --- Chirp tokenizer (renamed from ToneTokenizer) ---
+
+class ChirpTokenizer(nn.Module):
+    """Tokenize time-domain signals into chirp tokens.
 
     Orchestrates DechirpSTFT, PeakFinder, and (optionally) NoiseModel
     into a single forward pass: STFT → whitening → peak finding →
-    normalization → token output.
+    normalization → chirp token output.
+
+    Chirp tokens are the building blocks for voice formation: adjacent
+    tokens with compatible boundary values (f_end[w] ≈ f_start[w+1],
+    phase_end[w] ≈ phase_start[w+1]) can be stitched into phase-coherent
+    voices.
 
     Parameters
     ----------
     k : int
-        Window size (FFT size) in samples.
+        Window size in samples.  Must be a multiple of 4.
+    R : int
+        Warp resolution (default 1).
     n_peaks : int
         Number of peaks to extract per time window.
     radius : int
@@ -641,34 +610,25 @@ class ToneTokenizer(nn.Module):
     n_dlnf : int
         Number of dlnf (relative chirp rate) grid points.
     dlnf_min, dlnf_max : float
-        Range of dlnf grid.
+        Range of dlnf grid.  |dlnf| ≤ 0.5 recommended.
     noise_model : NoiseModel or None
-        Pre-configured noise model for whitening.  If None, no whitening
-        is applied.  Can be set later via the ``noise_model`` attribute.
+        Pre-configured noise model for whitening.
 
     Output
     ------
-    forward(x) returns raw tokens of shape (B, N_WINDOWS, n_peaks, 9)
-    with 9 values per peak: [snr, t_start, t_end, f_start, f_end, A_start,
-    A_end, phase_start, phase_end].
-    snr is the peak amplitude from the (optionally whitened) STFT — when
-    whitening is active this is a true signal-to-noise ratio.
-    t_start and t_end are sample positions at half-window boundaries (k/4 and
-    3k/4), normalized to [-1, 1] over the signal length.  For adjacent windows,
-    t_end[w] = t_start[w+1].
-    f_start and f_end are normalized to [-1, 1] (mapping from [0, Fk-1] where
-    Fk = k // 2 + 1).  A_start and A_end are boundary amplitudes recovered
-    via weighted FFTs and mixing matrix inversion.  phase_start and phase_end
-    are wrapped to [-pi, pi].  For adjacent windows, f_end[w] ≈ f_start[w+1]
-    for clean signals.
+    forward(x) returns chirp tokens of shape (B, W, K, 9):
+    [snr, t_start, t_end, f_start, f_end, A_start, A_end,
+     phase_start, phase_end].
+    All boundary quantities are at t = ±½ (samples k/4 and 3k/4).
     """
 
-    def __init__(self, k: int = 1024, n_peaks: int = 3, radius: int = 2,
-                 n_dlnf: int = 11, dlnf_min: float = 0.0, dlnf_max: float = 0.05,
+    def __init__(self, k: int = 1024, R: int = 1, n_peaks: int = 3,
+                 radius: int = 2, n_dlnf: int = 11,
+                 dlnf_min: float = 0.0, dlnf_max: float = 0.05,
                  noise_model: 'NoiseModel | None' = None):
         super().__init__()
-        self.stft = DechirpSTFT(k=k)
-        self.peak_finder = PeakFinder(k=k)
+        self.stft = DechirpSTFT(k=k, R=R)
+        self.peak_finder = PeakFinder(k=k, R=R)
         self.noise_model = noise_model
         self.n_peaks = n_peaks
         self.radius = radius
@@ -681,12 +641,12 @@ class ToneTokenizer(nn.Module):
 
     @property
     def n_raw(self):
-        """Number of raw features per peak token (always 9)."""
+        """Number of raw features per chirp token (always 9)."""
         return 9
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Tokenize batched time-domain signals.
+        """Tokenize batched time-domain signals into chirp tokens.
 
         Parameters
         ----------
@@ -695,20 +655,14 @@ class ToneTokenizer(nn.Module):
         Returns
         -------
         tokens : Tensor, shape (B, W, K, 9)
-            Values per peak: [snr, t_start, t_end, f_start, f_end, A_start,
-            A_end, phase_start, phase_end].
-            snr is peak amplitude (SNR when whitened).
-            t_start/t_end are normalized to [-1, 1] over signal length.
-            f_start/f_end are normalized to [-1, 1].
-            A_start/A_end are boundary amplitudes.
-            phase_start/phase_end are wrapped to [-pi, pi].
-            W = number of time windows, K = n_peaks.
+            [snr, t_start, t_end, f_start, f_end, A_start, A_end,
+             phase_start, phase_end].
         """
         B, N = x.shape
 
         X_start, X_end = self.stft(
-            x, dlnf=self.dlnf_grid, n_hann_splits=2)  # (B, W, D, Fk)
-        X = X_start + X_end  # standard Hann-windowed FFT
+            x, dlnf=self.dlnf_grid, n_hann_splits=2)
+        X = X_start + X_end
 
         if self.noise_model is not None:
             X_w = self.noise_model.whiten(X)
@@ -722,23 +676,21 @@ class ToneTokenizer(nn.Module):
         A_start, A_end = self.peak_finder.peak_amplitudes(
             X_start, X_end, peaks, freq)
 
-        # Time at half-window boundaries: sample k/4 and 3k/4 per window
+        # Time at token boundaries: n(±½) = k/4 and 3k/4
         k = self.stft.k
         hop = self.stft.hop
         W = peaks.shape[-3]
         w_idx = torch.arange(W, device=x.device, dtype=x.dtype)
-        # Absolute sample positions of boundaries
-        t_s = w_idx * hop + k // 4       # (W,)
-        t_e = w_idx * hop + 3 * k // 4   # (W,)
+        t_s = w_idx * hop + k // 4
+        t_e = w_idx * hop + 3 * k // 4
         # Normalize to [-1, 1] over signal length
         t_s = 2.0 * t_s / (N - 1) - 1.0
         t_e = 2.0 * t_e / (N - 1) - 1.0
-        # Broadcast to match peak dims: (W,) -> (W, 1) -> matches (B, W, K)
         t_start = t_s.unsqueeze(-1).expand_as(freq)
         t_end = t_e.unsqueeze(-1).expand_as(freq)
 
-        # Frequency at half-window boundaries (dlnf is per hop,
-        # boundaries are ±0.5 hops from center)
+        # Frequency at token boundaries (dlnf is per hop = β/2,
+        # boundaries span ±½ in t, so ±β/2 in log-frequency from center)
         f_start = freq * torch.exp(-dlnf / 2)
         f_end = freq * torch.exp(dlnf / 2)
 
@@ -755,3 +707,7 @@ class ToneTokenizer(nn.Module):
             [snr, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe], dim=-1)
 
         return tokens
+
+
+# Backwards compatibility alias
+ToneTokenizer = ChirpTokenizer
