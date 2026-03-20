@@ -260,7 +260,7 @@ GPU + PyTorch autograd):
 - **jax-finufft** — relevant for the JAX side of this project
   (signal synthesis); full autodiff support.
 
-### FFT zero-pad factor R
+### Warp resolution R
 
 The number of τ-grid samples need not equal k.  An integer
 factor R gives:
@@ -271,10 +271,15 @@ The τ-grid has k_tau samples at positions τ_n = 2n/k_tau − 1, and
 the FFT produces k_tau/2 + 1 positive frequency bins — R times the
 base resolution.  Default R = 1 (current behavior).
 
-For R > 1, the original frequency bins at indices 0, 1, …, k/2 map
+Note: this is NOT the same as FFT zero-padding.  Each of the k_tau
+τ-samples is independently interpolated from the k source samples
+via the warp — they carry real signal values at distinct warped
+positions, not padded zeros.  The resulting frequency bins contain
+genuinely different information from a zero-padded k-point FFT.
+
+For R > 1, the base frequency bins at indices 0, 1, …, k/2 map
 to indices 0, R, 2R, … in the k_tau-point FFT, landing exactly on
-integer positions.  This means the base-resolution bins are always
-present; the extra bins are interpolated values in between.
+integer positions when R is integer.
 
 The phase formula generalizes to:
 
@@ -283,10 +288,10 @@ The phase formula generalizes to:
 which reduces to π · m when R = 1.
 
 Benefits of R > 1:
-- Finer frequency resolution without changing the window size.
+- Finer frequency resolution of the dechirped spectrum.
 - Reduces parabolic interpolation error for sub-bin peak finding.
-- Equivalent to zero-padding the FFT — no information is added, but
-  the existing information is sampled more densely in frequency.
+- Denser sampling of the warped signal captures more detail of the
+  effective window shape in τ-space.
 
 ### Sample-index form
 
@@ -360,7 +365,7 @@ relates to the phase at the window center (sample k/2, t = 0) by:
 
     φ_center = arg(X[m]) + π · m / R
 
-where R is the FFT zero-pad factor (§3).  For R = 1
+where R is the warp resolution (§3).  For R = 1
 (no oversampling) this simplifies to φ_center = arg(X[m]) + π · m.
 
 This is exact and **does not depend on the fractional bin offset δ**.

@@ -17,10 +17,11 @@ conventions change.
 Add `assert k % 4 == 0` so that all landmark positions (t = −1, −½,
 0, +½, +1) map to integer bin centers via `n(t) = k/2 · (t + 1)`.
 
-Add FFT zero-pad factor `R: int = 1` to `DechirpSTFT.__init__`.
+Add warp resolution `R: int = 1` to `DechirpSTFT.__init__`.
 Store `self.R = R`, `self.k_tau = R * k`,
-`self.Fk_tau = R * k // 2 + 1`.  `R` is the FFT zero-pad factor:
-the FFT uses R·k frequency bins (default R = 1, no zero-padding).
+`self.Fk_tau = R * k // 2 + 1`.  `R` is the warp resolution:
+k_tau = R·k τ-samples, giving R·k/2+1 frequency bins
+(default R = 1).
 
 ---
 
@@ -69,7 +70,7 @@ with `n(t) = k/2·(t+1)` evaluated at discrete sample positions.
 **File:** `DechirpSTFT._resample_dechirp_batched`
 
 Changes:
-1. Add FFT zero-pad factor `R` (int, default 1).
+1. Add warp resolution `R` (int, default 1).
    `k_tau = R * k` destination samples in τ-space.
 2. Replace `tau_uniform ∈ [0, 1]` with `τ ∈ [-1, 1]` (k_tau discrete
    points via `2 * torch.arange(k_tau) / k_tau - 1`).
@@ -127,7 +128,7 @@ phi_0 = X_peak.angle() - torch.pi * f_delta * (self.k - 1) / self.k
 ```python
 phi_center = X_peak.angle() + torch.pi * freq_idx.float() / R
 ```
-where R is the zero-pad factor (R = 1 reduces to `+ π * freq_idx`).
+where R is the warp resolution (R = 1 reduces to `+ π * freq_idx`).
 
 Then propagate to boundaries using the forward warp (§3 of the doc):
 ```python
