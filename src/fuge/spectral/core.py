@@ -33,23 +33,18 @@ class DechirpSTFT(nn.Module):
     ----------
     k : int
         Window size in samples.  Must be a multiple of 4.
-    R : int
-        Warp resolution: the τ-grid has R·k samples, giving R·k/2+1
-        frequency bins.  Default 1 (no extra resolution).
 
     Output shape: (B, N_WINDOWS, D, Fk) complex-valued,
-    where Fk = R·k // 2 + 1.
-    N_WINDOWS = (N - k) // (k // 2) + 1  (with hop = k // 2).
+    where Fk = k/2 + 1.
+    N_WINDOWS = (N - k) // hop + 1  (with hop = k/2).
     """
 
-    def __init__(self, k: int, R: int = 1):
+    def __init__(self, k: int):
         super().__init__()
         assert k % 4 == 0, f"k must be a multiple of 4, got {k}"
         self.k = k
-        self.hop = k // 2
-        self.R = R
-        self.k_tau = R * k
-        self.Fk = R * k // 2 + 1
+        self.hop = k // 2       # integer, k is multiple of 4
+        self.Fk = k // 2 + 1
         self.register_buffer("window", torch.hann_window(k, periodic=True))
 
         # Weighted sub-windows for boundary amplitude estimation.
@@ -83,7 +78,7 @@ class DechirpSTFT(nn.Module):
         Returns
         -------
         X : complex Tensor, shape (B, N_WINDOWS, D, Fk) (if n_hann_splits=1)
-            Fk = R·k // 2 + 1 positive-frequency bins (via rfft).
+            Fk = k/2 + 1 positive-frequency bins (via rfft).
         (X_start, X_end) : tuple of complex Tensors (if n_hann_splits=2)
             Each has shape (B, N_WINDOWS, D, Fk).
         """
@@ -112,8 +107,8 @@ class DechirpSTFT(nn.Module):
         for wf in win_funcs:
             windowed = raw_windows * wf
             windowed = self._apply_warp(windowed, warp_grid)
-            windowed = windowed.permute(1, 2, 0, 3)  # (D,B,W,k_tau) -> (B,W,D,k_tau)
-            results.append(torch.fft.rfft(windowed, n=self.k_tau, dim=-1))
+            windowed = windowed.permute(1, 2, 0, 3)  # (D,B,W,k) -> (B,W,D,k)
+            results.append(torch.fft.rfft(windowed, n=self.k, dim=-1))
 
         if n_hann_splits == 1:
             return results[0]
@@ -122,16 +117,15 @@ class DechirpSTFT(nn.Module):
     def _compute_warp_grid(self, beta: torch.Tensor):
         """Precompute warp source positions and Jacobian for given β values.
 
-        Returns a dict with t_source, jacobian, idx_lo, idx_hi, frac
+        Returns a dict with idx_lo, idx_hi, frac, jacobian
         that can be reused across sub-windows.
         """
         D = beta.shape[0]
         k = self.k
-        k_tau = self.k_tau
         device = beta.device
 
-        # Destination grid in τ-space: k_tau samples at τ_n = 2n/k_tau - 1
-        tau = _make_t_grid(k_tau).to(device)
+        # Destination grid in τ-space: k samples at τ_n = 2n/k - 1
+        tau = _make_t_grid(k).to(device)
 
         # Replace near-zero betas to avoid division by zero
         small = beta.abs() < 1e-8
@@ -142,7 +136,7 @@ class DechirpSTFT(nn.Module):
         t_source = torch.log(
             1.0 + ((tau.unsqueeze(0) + 1.0) / 2.0)
             * (e2b.unsqueeze(1) - 1.0)
-        ) / beta_safe.unsqueeze(1) - 1.0  # (D, k_tau)
+        ) / beta_safe.unsqueeze(1) - 1.0  # (D, k)
 
         # For near-zero beta, use identity grid
         t_source = torch.where(small.unsqueeze(1), tau.unsqueeze(0), t_source)
@@ -155,15 +149,15 @@ class DechirpSTFT(nn.Module):
         jacobian = torch.exp(-beta_safe.unsqueeze(1) * (t_source - t_at_zero.unsqueeze(1)))
         jacobian = torch.where(small.unsqueeze(1), torch.ones_like(jacobian), jacobian)
 
-        # Map source positions to index space on the original k-sample grid
+        # Map source positions to index space [0, k-1]
         # n(t) = k/2 · (t + 1)
-        idx = (k / 2.0) * (t_source + 1.0)  # (D, k_tau)
+        idx = (k / 2.0) * (t_source + 1.0)  # (D, k)
         idx_lo = idx.long().clamp(0, k - 2)
         idx_hi = idx_lo + 1
         frac = idx - idx_lo.float()
 
         return {
-            'D': D, 'k_tau': k_tau, 'small': small,
+            'D': D, 'k': k,
             'idx_lo': idx_lo, 'idx_hi': idx_hi, 'frac': frac,
             'jacobian': jacobian,
         }
@@ -178,15 +172,15 @@ class DechirpSTFT(nn.Module):
 
         Returns
         -------
-        resampled : Tensor, shape (D, B, W, k_tau)
+        resampled : Tensor, shape (D, B, W, k)
         """
         D = grid['D']
-        k_tau = grid['k_tau']
+        k = grid['k']
         B, W, _ = windowed.shape
 
         windowed_exp = windowed.unsqueeze(0).expand(D, -1, -1, -1)
-        idx_lo_exp = grid['idx_lo'][:, None, None, :].expand(D, B, W, k_tau)
-        idx_hi_exp = grid['idx_hi'][:, None, None, :].expand(D, B, W, k_tau)
+        idx_lo_exp = grid['idx_lo'][:, None, None, :].expand(D, B, W, k)
+        idx_hi_exp = grid['idx_hi'][:, None, None, :].expand(D, B, W, k)
         frac_exp = grid['frac'][:, None, None, :]
 
         lo_vals = torch.gather(windowed_exp, 3, idx_lo_exp)
@@ -210,7 +204,7 @@ class PeakFinder(nn.Module):
     ----------
     stft : DechirpSTFT
         The STFT instance that produced the input.  PeakFinder reads
-        k, R, Fk, and window buffers from this reference.
+        k, Fk, and window buffers from this reference.
     correct_parabolic : bool
         Apply Hann-window parabolic interpolation bias correction (default True).
     correct_scalloping : bool
@@ -235,10 +229,6 @@ class PeakFinder(nn.Module):
     @property
     def k(self):
         return self.stft.k
-
-    @property
-    def R(self):
-        return self.stft.R
 
     @property
     def Fk(self):
@@ -429,7 +419,7 @@ class PeakFinder(nn.Module):
         """Estimate phase at token boundaries (t = ±½) for each peak.
 
         Uses the periodic Hann phase anchor (§6 of spectral_math.md):
-        φ_center = arg(X[m]) + π·m/R, exact and δ-independent.
+        φ_center = arg(X[m]) + π·m, exact and δ-independent.
         Then propagates to t = ±½ via the forward warp.
 
         Parameters
@@ -450,7 +440,6 @@ class PeakFinder(nn.Module):
         """
         B, W, D, Fk = X.shape
         K = peaks.shape[2]
-        R = self.R
 
         peaks_flat = peaks.reshape(B * W, K, 2)
         dlnf_idx, freq_idx = self._unravel_peaks(peaks_flat)
@@ -461,8 +450,8 @@ class PeakFinder(nn.Module):
         X_peak = Xp.gather(1, flat_idx)
 
         # Phase anchor at window center in τ-space (sample k/2):
-        # φ_center = arg(X[m]) + π·m/R
-        phi_center = X_peak.angle() + torch.pi * freq_idx.float() / R
+        # φ_center = arg(X[m]) + π·m
+        phi_center = X_peak.angle() + torch.pi * freq_idx.float()
 
         # [Fix #2: use dlnf_refined instead of dlnf_grid[dlnf_idx]]
         # The refined value gives more accurate phase propagation.
@@ -616,8 +605,6 @@ class ChirpTokenizer(nn.Module):
     ----------
     k : int
         Window size in samples.  Must be a multiple of 4.
-    R : int
-        Warp resolution (default 1).
     n_peaks : int
         Number of peaks to extract per time window.
     radius : int
@@ -637,12 +624,12 @@ class ChirpTokenizer(nn.Module):
     All boundary quantities are at t = ±½ (samples k/4 and 3k/4).
     """
 
-    def __init__(self, k: int = 1024, R: int = 1, n_peaks: int = 3,
+    def __init__(self, k: int = 1024, n_peaks: int = 3,
                  radius: int = 2, n_dlnf: int = 11,
                  dlnf_min: float = 0.0, dlnf_max: float = 0.05,
                  noise_model: 'NoiseModel | None' = None):
         super().__init__()
-        self.stft = DechirpSTFT(k=k, R=R)
+        self.stft = DechirpSTFT(k=k)
         self.peak_finder = PeakFinder(stft=self.stft)
         self.noise_model = noise_model
         self.n_peaks = n_peaks
@@ -696,8 +683,8 @@ class ChirpTokenizer(nn.Module):
         hop = self.stft.hop
         W = peaks.shape[-3]
         w_idx = torch.arange(W, device=x.device, dtype=x.dtype)
-        t_s = w_idx * hop + k // 4
-        t_e = w_idx * hop + 3 * k // 4
+        t_s = w_idx * hop + k / 4
+        t_e = w_idx * hop + 3 * k / 4
         # Normalize to [-1, 1] over signal length
         t_s = 2.0 * t_s / (N - 1) - 1.0
         t_e = 2.0 * t_e / (N - 1) - 1.0

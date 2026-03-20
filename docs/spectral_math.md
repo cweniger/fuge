@@ -260,47 +260,19 @@ GPU + PyTorch autograd):
 - **jax-finufft** — relevant for the JAX side of this project
   (signal synthesis); full autodiff support.
 
-### Warp resolution R
-
-The number of τ-grid samples need not equal k.  An integer
-factor R gives:
-
-    k_tau = R · k
-
-The τ-grid has k_tau samples at positions τ_n = 2n/k_tau − 1, and
-the FFT produces k_tau/2 + 1 positive frequency bins — R times the
-base resolution.  Default R = 1 (current behavior).
-
-Note: this is NOT the same as FFT zero-padding.  Each of the k_tau
-τ-samples is independently interpolated from the k source samples
-via the warp — they carry real signal values at distinct warped
-positions, not padded zeros.  The resulting frequency bins contain
-genuinely different information from a zero-padded k-point FFT.
-
-For R > 1, the base frequency bins at indices 0, 1, …, k/2 map
-to indices 0, R, 2R, … in the k_tau-point FFT, landing exactly on
-integer positions when R is integer.
-
-The phase formula generalizes to:
-
-    φ_center = arg(X[m]) + π · m / R
-
-which reduces to π · m when R = 1.
-
-Benefits of R > 1:
-- Finer frequency resolution of the dechirped spectrum.
-- Reduces parabolic interpolation error for sub-bin peak finding.
-- Denser sampling of the warped signal captures more detail of the
-  effective window shape in τ-space.
-
 ### Sample-index form
 
-In t-space, samples sit at t_n = 2n/k − 1 for n = 0, …, k − 1.
-In τ-space, samples sit at τ_n = 2n/k_tau − 1 for n = 0, …, k_tau − 1.
-Both map to source positions via n(·) = k/2 · (· + 1).  The
-resampling reads the windowed signal at source positions n(t(τ_n)),
+In both t-space and τ-space, samples sit at t_n = 2n/k − 1 for
+n = 0, …, k − 1.  Both map to source positions via n(·) = k/2 · (· + 1).
+The resampling reads the windowed signal at source positions n(t(τ_n)),
 interpolating on the original k-sample grid, then applies the
 Jacobian correction.
+
+Note: the τ-grid has the same k samples as the source grid.
+Increasing the number of τ-samples beyond k does not improve
+frequency resolution — the information content is limited by the
+k source samples (k/2 + 1 independent frequency bins).  For finer
+frequency resolution, use a larger window (larger k).
 
 ---
 
@@ -363,10 +335,7 @@ giving a clean phase relationship.
 For the periodic Hann of length k, the FFT phase at integer bin m
 relates to the phase at the window center (sample k/2, t = 0) by:
 
-    φ_center = arg(X[m]) + π · m / R
-
-where R is the warp resolution (§3).  For R = 1
-(no oversampling) this simplifies to φ_center = arg(X[m]) + π · m.
+    φ_center = arg(X[m]) + π · m
 
 This is exact and **does not depend on the fractional bin offset δ**.
 The proof: shifting the DFT sum to center at k/2 pulls out a factor

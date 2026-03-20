@@ -17,12 +17,6 @@ conventions change.
 Add `assert k % 4 == 0` so that all landmark positions (t = −1, −½,
 0, +½, +1) map to integer bin centers via `n(t) = k/2 · (t + 1)`.
 
-Add warp resolution `R: int = 1` to `DechirpSTFT.__init__`.
-Store `self.R = R`, `self.k_tau = R * k`,
-`self.Fk_tau = R * k // 2 + 1`.  `R` is the warp resolution:
-k_tau = R·k τ-samples, giving R·k/2+1 frequency bins
-(default R = 1).
-
 ---
 
 ## Step 2: Switch to periodic Hann explicitly
@@ -70,10 +64,8 @@ with `n(t) = k/2·(t+1)` evaluated at discrete sample positions.
 **File:** `DechirpSTFT._resample_dechirp_batched`
 
 Changes:
-1. Add warp resolution `R` (int, default 1).
-   `k_tau = R * k` destination samples in τ-space.
-2. Replace `tau_uniform ∈ [0, 1]` with `τ ∈ [-1, 1]` (k_tau discrete
-   points via `2 * torch.arange(k_tau) / k_tau - 1`).
+1. Replace `tau_uniform ∈ [0, 1]` with `τ ∈ [-1, 1]` (k discrete
+   points via `2 * torch.arange(k) / k - 1`).
 3. Inverse warp formula:
    `t_source = ln[1 + ((τ+1)/2)·(exp(2β)−1)] / β − 1`
    with β = betas (already the full-window parameter).
@@ -88,9 +80,6 @@ Changes:
 7. Linear interpolation and gather remain the same.
 8. Enforce `|dlnf| ≤ 0.5` (linear interpolation is adequate in
    this range; for larger values, an NUFFT backend would be needed).
-9. FFT is now k_tau-point, giving k_tau/2 + 1 positive frequency
-   bins.  Output shape changes from (B, W, D, Fk) to
-   (B, W, D, Fk_tau) where Fk_tau = k_tau/2 + 1 = R*k/2 + 1.
 
 ---
 
@@ -126,9 +115,8 @@ phi_0 = X_peak.angle() - torch.pi * f_delta * (self.k - 1) / self.k
 
 **New (anchor at window center, no fractional-bin correction):**
 ```python
-phi_center = X_peak.angle() + torch.pi * freq_idx.float() / R
+phi_center = X_peak.angle() + torch.pi * freq_idx.float()
 ```
-where R is the warp resolution (R = 1 reduces to `+ π * freq_idx`).
 
 Then propagate to boundaries using the forward warp (§3 of the doc):
 ```python
