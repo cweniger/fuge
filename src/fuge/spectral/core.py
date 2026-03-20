@@ -615,7 +615,12 @@ class ChirpTokenizer(nn.Module):
     forward(x) returns chirp tokens of shape (B, W, K, 9):
     [snr, t_start, t_end, f_start, f_end, A_start, A_end,
      phase_start, phase_end].
-    All boundary quantities are at t = ±½ (samples k/4 and 3k/4).
+    t_start/t_end: absolute sample indices in the input signal.
+    f_start/f_end: frequency in cycles per sample (0 to 0.5) at
+        token boundaries.  Multiply by f_sample to get Hz.
+    phase_start: wrapped to (-π, π].
+    phase_end: phase_start + unrolled phase advance across one hop.
+    Total voice phase = Σ(phase_end[w] - phase_start[w]).
     """
 
     def __init__(self, k: int = 1024, n_peaks: int = 3,
@@ -653,6 +658,8 @@ class ChirpTokenizer(nn.Module):
         tokens : Tensor, shape (B, W, K, 9)
             [snr, t_start, t_end, f_start, f_end, A_start, A_end,
              phase_start, phase_end].
+            t: sample indices.  f: cycles/sample (0–0.5).
+            ps: wrapped (-π,π].  pe: ps + unrolled advance.
         """
         B, N = x.shape
 
@@ -672,32 +679,29 @@ class ChirpTokenizer(nn.Module):
         A_start, A_end = self.peak_finder.peak_amplitudes(
             X_start, X_end, peaks, freq)
 
-        # Time at token boundaries: n(±½) = k/4 and 3k/4
+        # Time at token boundaries: absolute sample indices
         k = self.stft.k
         hop = self.stft.hop
         W = peaks.shape[-3]
         w_idx = torch.arange(W, device=x.device, dtype=x.dtype)
-        t_s = w_idx * hop + k / 4
-        t_e = w_idx * hop + 3 * k / 4
-        # Normalize to [-1, 1] over signal length
-        t_s = 2.0 * t_s / (N - 1) - 1.0
-        t_e = 2.0 * t_e / (N - 1) - 1.0
+        t_s = w_idx * hop + k / 4       # sample index of t = -½
+        t_e = w_idx * hop + 3 * k / 4   # sample index of t = +½
         t_start = t_s.unsqueeze(-1).expand_as(freq)
         t_end = t_e.unsqueeze(-1).expand_as(freq)
 
-        # Frequency at token boundaries (dlnf is per hop = β/2,
-        # boundaries span ±½ in t, so ±β/2 in log-frequency from center)
-        f_start = freq * torch.exp(-dlnf / 2)
-        f_end = freq * torch.exp(dlnf / 2)
+        # Frequency at token boundaries in cycles per sample (0 to 0.5).
+        # freq (bin index) → cycles/sample: f_cps = f_bin / k.
+        # Chirp shifts: dlnf is per hop, boundaries at ±½ hop from center.
+        f_center_cps = freq / k
+        f_start = f_center_cps * torch.exp(-dlnf / 2)
+        f_end = f_center_cps * torch.exp(dlnf / 2)
 
-        # Normalize frequencies to [-1, 1] from [0, Fk-1]
-        Fk = self.stft.Fk
-        f_start = 2.0 * f_start / (Fk - 1) - 1.0
-        f_end = 2.0 * f_end / (Fk - 1) - 1.0
-
-        # Wrap phases to [-pi, pi]
+        # Phase: ps wrapped to (-pi, pi], pe = ps + unrolled advance.
+        # The advance pe_raw - ps_raw is the total phase accumulated
+        # across one hop, ≈ 2π · f_center_hop for a non-chirped signal.
+        advance = pe - ps  # unwrapped advance from peak_phases
         ps = (ps + torch.pi) % (2 * torch.pi) - torch.pi
-        pe = (pe + torch.pi) % (2 * torch.pi) - torch.pi
+        pe = ps + advance  # pe is NOT wrapped
 
         tokens = torch.stack(
             [snr, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe], dim=-1)
