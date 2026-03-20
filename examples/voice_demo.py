@@ -46,6 +46,14 @@ if __name__ == "__main__":
         N=args.N, noise_sigma=args.sigma, seed=args.seed)
     x = torch.from_numpy(noisy).unsqueeze(0).to(device)  # (1, N)
 
+    # True matched-filter SNR for each component: sqrt(sum(h^2)) / sigma
+    t = np.arange(args.N, dtype=np.float64)
+    h1 = 5.0 * np.cos(2 * np.pi * np.cumsum(0.05 + 1e-6 * t))
+    h2 = 2.0 * np.cos(2 * np.pi * np.cumsum(0.12 + 0.5e-6 * t))
+    snr1 = np.sqrt(np.sum(h1**2)) / args.sigma
+    snr2 = np.sqrt(np.sum(h2**2)) / args.sigma
+    print(f"True matched-filter SNR: voice 1 = {snr1:.1f}, voice 2 = {snr2:.1f}")
+
     # Tokenize
     tokenizer = ChirpTokenizer(
         k=args.k, n_peaks=args.n_peaks, dlnf_min=0.0, dlnf_max=0.02, n_dlnf=11)
