@@ -60,7 +60,7 @@ class DechirpSTFT(nn.Module):
         self.register_buffer("window_start", ((1 - t) / 2) * self.window)
         self.register_buffer("window_end", ((1 + t) / 2) * self.window)
 
-    def forward(self, x: torch.Tensor, dlnf: torch.Tensor = None,
+    def forward(self, x: torch.Tensor, dlnf=0.,
                 n_hann_splits: int = 1):
         """Compute the de-chirped windowed FFT.
 
@@ -71,7 +71,7 @@ class DechirpSTFT(nn.Module):
         ----------
         x : Tensor, shape (B, N)
             Batched time-domain signals.
-        dlnf : Tensor of shape (D,), or None
+        dlnf : float, list, or Tensor
             Relative chirp parameter: change in ln(f) per hop step,
             i.e. dlnf = (fdot/f) · T_hop  (dimensionless).
             |dlnf| ≤ 0.5 supported (linear interpolation adequate).
@@ -88,8 +88,10 @@ class DechirpSTFT(nn.Module):
         (X_start, X_end) : tuple of complex Tensors (if n_hann_splits=2)
             Each has shape (B, N_WINDOWS, D, Fk).
         """
-        if dlnf is None:
-            dlnf = torch.zeros(1, device=x.device)
+        if not isinstance(dlnf, torch.Tensor):
+            dlnf = torch.as_tensor(dlnf, dtype=x.dtype, device=x.device)
+        if dlnf.dim() == 0:
+            dlnf = dlnf.unsqueeze(0)
 
         # β = 2·dlnf: total log-frequency change across the full window
         beta = 2.0 * dlnf
@@ -106,7 +108,6 @@ class DechirpSTFT(nn.Module):
             raise ValueError(f"n_hann_splits must be 1 or 2, got {n_hann_splits}")
 
         # Precompute warp grid and Jacobian (shared across sub-windows)
-        # [Fix #7: avoid recomputing the same warp for each sub-window]
         warp_grid = self._compute_warp_grid(beta)
 
         R = self.R
@@ -155,7 +156,6 @@ class DechirpSTFT(nn.Module):
         t_source = torch.where(small.unsqueeze(1), tau.unsqueeze(0), t_source)
 
         # Jacobian correction: exp(-β · (t(τ) - t(τ=0)))
-        # [Fix #4: use analytical t(0) instead of discrete midpoint]
         # t(τ=0) = ln[1 + 0.5·(exp(2β)-1)] / β - 1
         t_at_zero = torch.log(1.0 + 0.5 * (e2b - 1.0)) / beta_safe - 1.0
         t_at_zero = torch.where(small, torch.zeros_like(t_at_zero), t_at_zero)
@@ -227,7 +227,6 @@ class PeakFinder(nn.Module):
     def __init__(self, stft: DechirpSTFT, correct_parabolic: bool = True,
                  correct_scalloping: bool = True):
         super().__init__()
-        # [Fix #1/#3: take DechirpSTFT reference, eliminate parameter duplication]
         self.stft = stft
         self.correct_parabolic = correct_parabolic
         self.correct_scalloping = correct_scalloping
@@ -254,7 +253,6 @@ class PeakFinder(nn.Module):
         Linear amplitude model A(t) = A_start·(½-t) + A_end·(½+t),
         evaluated at the token boundaries t = ±½.
         """
-        # [Fix #3: reuse window buffers from stft instead of recomputing]
         t = _make_t_grid(stft.k)
         window_start = stft.window_start.detach().cpu()
         window_end = stft.window_end.detach().cpu()
@@ -295,7 +293,6 @@ class PeakFinder(nn.Module):
             ym, y0, yp = mags
             denom = ym - 2.0 * y0 + yp
             para_d[i] = 0.5 * (ym - yp) / denom if denom.abs() > 1e-12 else 0.0
-        # [Fix #8: use module-level numpy import]
         n_inv = 64
         para_grid = torch.linspace(0, 0.5, n_inv, dtype=torch.float64)
         true_inv = np.interp(
@@ -466,8 +463,7 @@ class PeakFinder(nn.Module):
         # φ_center = arg(X[m]) + π·m
         phi_center = X_peak.angle() + torch.pi * freq_idx.float()
 
-        # [Fix #2: use dlnf_refined instead of dlnf_grid[dlnf_idx]]
-        # The refined value gives more accurate phase propagation.
+        # Use parabolic-refined dlnf for more accurate phase propagation
         beta = 2.0 * dlnf_refined.reshape(B * W, K)
 
         # Propagate to token boundaries via forward warp.
