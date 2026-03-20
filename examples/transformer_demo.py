@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-from fuge.spectral import ToneTokenizer, ToneTokenEmbedding
+from fuge.spectral import ChirpTokenizer, ChirpTokenEmbedding
 from fuge.nn import TransformerEmbedding
 from chirp import chirp_signal
 
@@ -95,7 +95,7 @@ def generate_dataset(n_signals, rng):
 TOKENIZE_BATCH = 64  # signals per GPU batch during tokenization
 
 def tokenize_signals(signals, tokenizer, device):
-    """Tokenize signals in batches using ToneTokenizer."""
+    """Tokenize signals in batches using ChirpTokenizer."""
     all_tokens = []
     for start in range(0, len(signals), TOKENIZE_BATCH):
         batch = torch.from_numpy(signals[start:start + TOKENIZE_BATCH]).to(
@@ -128,7 +128,7 @@ class ChirpTokenDataset(Dataset):
 # =====================================================================
 
 class ChirpModel(nn.Module):
-    """ToneTokenEmbedding + TransformerEmbedding backbone + regression head."""
+    """ChirpTokenEmbedding + TransformerEmbedding backbone + regression head."""
 
     def __init__(self, token_emb, backbone, n_out, dropout=0.1):
         super().__init__()
@@ -280,7 +280,7 @@ if __name__ == "__main__":
 
     # 3. Tokenize
     print("Tokenizing signals...")
-    tokenizer = ToneTokenizer(
+    tokenizer = ChirpTokenizer(
         k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double().to(device)
@@ -291,7 +291,7 @@ if __name__ == "__main__":
     print(f"  Token shape: {train_tokens.shape}")
 
     # 4. Build token embedding and compute normalization
-    token_emb = ToneTokenEmbedding(phase_mode=PHASE_MODE,
+    token_emb = ChirpTokenEmbedding(phase_mode=PHASE_MODE,
                                       mask_phases=MASK_PHASES).double().to(device)
     token_emb.compute_normalization(train_tokens)
 

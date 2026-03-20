@@ -6,7 +6,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 import torch
 
-from fuge.spectral import DechirpSTFT
+from fuge.spectral import DechirpSTFT, PeakFinder
 
 if __name__ == "__main__":
     # Inline test signal (PN-inspired chirp, no JAX dependency)
@@ -29,6 +29,7 @@ if __name__ == "__main__":
 
     k = 4096
     decomposer = DechirpSTFT(k=k).to(device)
+    peak_finder = PeakFinder(stft=decomposer).to(device)
     noise_rms = np.sqrt(k * 3.0 / 8.0)
 
     # --- dlnf grid hyperparameters ---
@@ -46,10 +47,10 @@ if __name__ == "__main__":
     for ax, sigma in zip(axes, noise_sigmas):
         noise = rng.standard_normal(N) * sigma
         x_noisy = h + noise
-        x = torch.from_numpy(x_noisy).float().to(device)
+        x = torch.from_numpy(x_noisy).float().to(device).unsqueeze(0)  # (1, N)
 
-        X_grid = decomposer(x, dlnf=dlnf_grid)
-        amp_zero = X_grid[0].abs().cpu().numpy()[:, :k // 2 + 1]
+        X_grid = decomposer(x, dlnf=dlnf_grid)  # (1, W, D, Fk)
+        amp_zero = X_grid[0, :, 0].abs().cpu().numpy()
         snr = amp_zero / (noise_rms * sigma)
         n_windows = snr.shape[0]
         t_centers = (np.arange(n_windows) * decomposer.hop + k / 2) / fs
@@ -61,10 +62,11 @@ if __name__ == "__main__":
         ax.set_ylim(params["f0"] * 0.5,
                      params["f0"] * (params["n_harmonics"] + 1) * 5)
 
-        peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
+        peaks, freq_refined, dlnf_refined, peak_vals = peak_finder.find_peaks(
             X_grid, K=3, dlnf_grid=dlnf_grid)
-        f_peak = freq_refined.cpu().numpy() * fs / k
-        dlnf_peak = dlnf_refined.cpu().numpy()
+        # Remove batch dim (B=1)
+        f_peak = freq_refined[0].cpu().numpy() * fs / k
+        dlnf_peak = dlnf_refined[0].cpu().numpy()
         dt_half = decomposer.hop / fs / 2
 
         for wi in range(n_windows):
@@ -104,16 +106,20 @@ if __name__ == "__main__":
         ax_res = axes2[si * 2 + 1]
 
         noise = np.random.default_rng(42).standard_normal(N) * sigma
-        x = torch.from_numpy((h + noise)).float().to(device)
-        X_grid = decomposer(x, dlnf=dlnf_grid)
+        x = torch.from_numpy((h + noise)).float().to(device).unsqueeze(0)  # (1, N)
+        X_grid = decomposer(x, dlnf=dlnf_grid)  # (1, W, D, Fk)
 
-        amp_zero = X_grid[0].abs().cpu().numpy()[:, :k // 2 + 1]
+        amp_zero = X_grid[0, :, 0].abs().cpu().numpy()
         snr = amp_zero / (noise_rms * sigma)
 
-        peaks, freq_refined, dlnf_refined, peak_vals = decomposer.find_peaks(
+        peaks, freq_refined, dlnf_refined, peak_vals = peak_finder.find_peaks(
             X_grid, K=3, dlnf_grid=dlnf_grid)
-        phase_start, phase_end = decomposer.peak_phases(
+        phase_start, phase_end = peak_finder.peak_phases(
             X_grid, peaks, freq_refined, dlnf_refined, dlnf_grid)
+
+        # Remove batch dim (B=1) for plotting
+        phase_start = phase_start[0]
+        phase_end = phase_end[0]
 
         # Phase residual: wrap(phase_start[w+1] - phase_end[w])
         residual = phase_start[1:] - phase_end[:-1]
@@ -121,8 +127,8 @@ if __name__ == "__main__":
         residual_np = residual.cpu().numpy()
         t_res = 0.5 * (t_centers[:-1] + t_centers[1:])
 
-        f_peak = freq_refined.cpu().numpy() * fs / k
-        dlnf_peak = dlnf_refined.cpu().numpy()
+        f_peak = freq_refined[0].cpu().numpy() * fs / k
+        dlnf_peak = dlnf_refined[0].cpu().numpy()
 
         res_abs = np.abs(residual_np)
         res_pad = np.concatenate([res_abs, res_abs[-1:]], axis=0)

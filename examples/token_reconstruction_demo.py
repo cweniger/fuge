@@ -22,7 +22,7 @@ jax.config.update("jax_enable_x64", True)
 
 sys.path.insert(0, ".")
 from chirp import chirp_signal
-from fuge.spectral import ToneTokenizer
+from fuge.spectral import ChirpTokenizer
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000
@@ -150,7 +150,7 @@ def main():
 
     # Tokenize
     print("Tokenizing...")
-    tokenizer = ToneTokenizer(
+    tokenizer = ChirpTokenizer(
         k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double()

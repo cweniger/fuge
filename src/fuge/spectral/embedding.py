@@ -1,10 +1,10 @@
-"""Tone token embedding: raw (B, W, K, 9) tokens -> (B, W*K, n_embed).
+"""Chirp token embedding: raw (B, W, K, 9) tokens -> (B, W*K, n_embed).
 
-Transforms raw tone features (snr, t_start, t_end, f_start, f_end,
+Transforms raw chirp token features (snr, t_start, t_end, f_start, f_end,
 A_start, A_end, phase_start, phase_end) into model-ready embedded
 features with z-score normalization.
 
-Input token format (from ToneTokenizer):
+Input token format (from ChirpTokenizer):
   snr: peak amplitude / noise std (log1p applied here)
   t_start, t_end: normalized time in [-1, 1]
   f_start, f_end: normalized frequency in [-1, 1]
@@ -16,8 +16,8 @@ import torch
 import torch.nn as nn
 
 
-class ToneTokenEmbedding(nn.Module):
-    """Embed raw spectral peak tokens into model-ready features.
+class ChirpTokenEmbedding(nn.Module):
+    """Embed raw chirp tokens into model-ready features.
 
     Applies log1p to snr and amplitudes, cos/sin to phases, passes time
     and frequency through directly, then z-score normalizes.

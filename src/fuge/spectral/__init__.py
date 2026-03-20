@@ -1,6 +1,9 @@
-"""Spectral signal analysis: STFT, tokenization, and token embedding."""
+"""Spectral signal analysis: STFT, peak finding, noise estimation, tokenization."""
 
-from fuge.spectral.core import DechirpSTFT, ToneTokenizer
-from fuge.spectral.embedding import ToneTokenEmbedding
+from fuge.spectral.core import DechirpSTFT, PeakFinder, NoiseModel, ChirpTokenizer
+from fuge.spectral.embedding import ChirpTokenEmbedding
 
-__all__ = ["DechirpSTFT", "ToneTokenizer", "ToneTokenEmbedding"]
+__all__ = [
+    "DechirpSTFT", "PeakFinder", "NoiseModel",
+    "ChirpTokenizer", "ChirpTokenEmbedding",
+]

@@ -14,7 +14,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 sys.path.insert(0, ".")
-from fuge.spectral import ToneTokenizer
+from fuge.spectral import ChirpTokenizer
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 10_000
@@ -153,14 +153,14 @@ def main():
 
     # Tokenize
     print("Tokenizing...")
-    tokenizer = ToneTokenizer(
+    tokenizer = ChirpTokenizer(
         k=K_WINDOW, n_peaks=N_PEAKS, n_dlnf=N_DLNF,
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double()
 
     # Get the dlnf=0 STFT (same as what goes into peak search)
-    X0 = tokenizer.decomposer(x, dlnf=0.0)  # (1, W, k)
-    stft_mag = X0[0, :, :K_WINDOW // 2 + 1].abs().numpy()  # (W, Fk)
+    X0 = tokenizer.stft(x)  # (B=1, W, D=1, Fk)
+    stft_mag = X0[0, :, 0].abs().numpy()  # (W, Fk)
 
     tokens = tokenizer(x)  # (1, W, K, 9)
     tokens = tokens[0].numpy()  # (W, K, 9)
