@@ -623,9 +623,11 @@ class ChirpTokenizer(nn.Module):
     t_start/t_end: absolute sample indices in the input signal.
     f_start/f_end: frequency in cycles per sample (0 to 0.5) at
         token boundaries.  Multiply by f_sample to get Hz.
-    phase_start: wrapped to (-π, π].
-    phase_end: phase_start + unrolled phase advance across one hop.
-    Total voice phase = Σ(phase_end[w] - phase_start[w]).
+    phase_start/phase_end: both unwrapped, defined up to a shared
+        additive constant of 2π multiples.  pe - ps is the exact
+        phase advance across one hop (no modular ambiguity).
+        For stitching: pe[w] ≈ ps[w+1] (mod 2π).
+        Total voice phase = Σ(pe[w] - ps[w]).
     """
 
     def __init__(self, k: int = 1024, n_peaks: int = 3,
@@ -666,9 +668,8 @@ class ChirpTokenizer(nn.Module):
         tokens : Tensor, shape (B, W, K, 9)
             [snr, t_start, t_end, f_start, f_end, A_start, A_end,
              phase_start, phase_end].
-            t: sample indices (absolute, in input signal).
-            f: cycles/sample (0–0.5).
-            ps: wrapped (-π,π].  pe: ps + unrolled advance.
+            t: sample indices.  f: cycles/sample (0–0.5).
+            ps, pe: unwrapped.  pe - ps = phase advance per hop.
         """
         B, N = x.shape
 
@@ -705,12 +706,10 @@ class ChirpTokenizer(nn.Module):
         f_start = f_center_cps * torch.exp(-dlnf / 2)
         f_end = f_center_cps * torch.exp(dlnf / 2)
 
-        # Phase: ps wrapped to (-pi, pi], pe = ps + unrolled advance.
-        # The advance pe_raw - ps_raw is the total phase accumulated
-        # across one hop, ≈ 2π · f_center_hop for a non-chirped signal.
-        advance = pe - ps  # unwrapped advance from peak_phases
-        ps = (ps + torch.pi) % (2 * torch.pi) - torch.pi
-        pe = ps + advance  # pe is NOT wrapped
+        # Phase: both ps and pe are unwrapped (raw from peak_phases).
+        # They are defined up to an additive constant of 2π multiples.
+        # pe - ps is the exact phase advance across one hop
+        # (no modular ambiguity, ≈ 2π · f_center · hop for non-chirped).
 
         tokens = torch.stack(
             [snr, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe], dim=-1)
