@@ -93,7 +93,7 @@ def tokenize_multi(signal, k_values, n_peaks, n_dlnf, dlnf_min, dlnf_max,
             k=k, n_peaks=n_peaks, n_dlnf=n_dlnf,
             dlnf_min=dlnf_min, dlnf_max=dlnf_max,
         ).double()
-        tok = tokenizer(x)[0].numpy()  # (W, K, 9)
+        tok = tokenizer(x).data[0].numpy()  # (W, K, 9)
 
         if f_max is not None:
             # f_start, f_end are in [-1, 1] mapping to [0, Fk-1] bins

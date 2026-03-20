@@ -95,7 +95,7 @@ if __name__ == "__main__":
 
     # Panel 3: Token spectrogram
     ax = axes[2]
-    tok = tokens[0].cpu()  # (W, K, 9)
+    tok = tokens.data[0].cpu()  # (W, K, 9)
     W, K, _ = tok.shape
     for ki in range(K):
         t_mid = (tok[:, ki, 1] + tok[:, ki, 2]) / 2
