@@ -16,7 +16,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
-from fuge.spectral import ChirpTokenizer, VoiceStitcher, VoiceStitchConfig
+from fuge.spectral import ChirpTokenizer, VoiceStitcher, VoiceStitchConfig, ChirpLinker
 
 
 def make_emri_signal(N, k, f0, dlnf_per_hop, A, n_harmonics=1,
@@ -157,16 +157,29 @@ if __name__ == "__main__":
     tokens = tokenizer(x)
     print(f"Tokens: {tokens.shape}")
 
-    # Stitch
+    # Link tokens
     config = VoiceStitchConfig(max_df=0.05, max_dphi=2.0, max_dA=0.8)
+    linker = ChirpLinker(config=config, min_length=args.min_length)
+    linked = linker(tokens)
+
+    chain_ids = linked.chain_id[0].cpu()
+    unique_chains = chain_ids.unique()
+    n_chains = (unique_chains >= 0).sum().item()
+    print(f"Linked: {n_chains} chains")
+    for cid in unique_chains:
+        if cid < 0:
+            continue
+        mask = chain_ids == cid
+        n_tok = mask.sum().item()
+        f_vals = linked.f_start[0].cpu()[mask]
+        snr_val = linked.snr[0].cpu()[mask][0].item()
+        print(f"  Chain {int(cid)}: {n_tok} tokens, "
+              f"f=[{f_vals.min():.4f}, {f_vals.max():.4f}], "
+              f"accumulated SNR={snr_val:.1f}")
+
+    # Also stitch for voice visualization
     stitcher = VoiceStitcher(config=config, min_length=args.min_length)
     voices = stitcher(tokens)
-
-    print(f"Found {len(voices[0])} voices")
-    for i, v in enumerate(voices[0]):
-        print(f"  Voice {i}: {v.shape[0]} anchors, "
-              f"f=[{v[:, 3].min():.4f}, {v[:, 3].max():.4f}], "
-              f"Δφ_total={v[-1, 2] - v[0, 2]:.1f} rad")
 
     # --- Plot ---
     t_samples = np.arange(N)
@@ -223,22 +236,47 @@ if __name__ == "__main__":
     ax.set_title("Stitched voices vs true frequency")
     ax.legend(fontsize=7, ncol=4)
 
-    # Panel 5: Phase residual (if voices found)
-    if len(voices[0]) > 0:
+    # Panel 5: Accumulated phase from linked tokens (detrended)
+    if n_chains > 0:
         ax = axes[4]
-        for i, v in enumerate(voices[0]):
-            v_np = v.cpu().numpy()
-            phi = v_np[:, 2]
-            t_anchor = v_np[:, 1]
-            if len(t_anchor) > 1:
-                slope = (phi[-1] - phi[0]) / (t_anchor[-1] - t_anchor[0])
-                phi_detrend = phi - slope * (t_anchor - t_anchor[0]) - phi[0]
+        lt = linked.data[0].cpu()
+        for ci, cid in enumerate(unique_chains):
+            if cid < 0:
+                continue
+            # Collect tokens in this chain, ordered by window
+            chain_mask = chain_ids == cid
+            # Get (w, k) indices for this chain
+            ws, ks = torch.where(chain_mask)
+            order = ws.argsort()
+            ws, ks = ws[order], ks[order]
+
+            # Accumulate phase: start from phase_start of first token
+            phi_accum = [lt[ws[0], ks[0], 7].item()]  # phase_start[0]
+            for j in range(len(ws)):
+                # Add within-token advance
+                ps_j = lt[ws[j], ks[j], 7].item()
+                pe_j = lt[ws[j], ks[j], 8].item()
+                phi_accum.append(phi_accum[-1] + (pe_j - ps_j))
+            phi_accum = np.array(phi_accum)
+
+            # Time anchors: start of first token, then end of each token
+            t_anchors = [lt[ws[0], ks[0], 1].item()]
+            for j in range(len(ws)):
+                t_anchors.append(lt[ws[j], ks[j], 2].item())
+            t_anchors = np.array(t_anchors)
+
+            # Detrend
+            if len(t_anchors) > 1:
+                slope = (phi_accum[-1] - phi_accum[0]) / (t_anchors[-1] - t_anchors[0])
+                phi_detrend = phi_accum - slope * (t_anchors - t_anchors[0]) - phi_accum[0]
             else:
-                phi_detrend = phi - phi[0]
-            ax.plot(t_anchor, phi_detrend, '-o', color=colors[i % len(colors)],
-                    ms=3, lw=1, label=f"voice {i}")
+                phi_detrend = phi_accum - phi_accum[0]
+
+            ax.plot(t_anchors, phi_detrend, '-o',
+                    color=colors[ci % len(colors)],
+                    ms=3, lw=1, label=f"chain {int(cid)}")
         ax.set_ylabel("φ − linear trend (rad)")
-        ax.set_title("Coherent phase (detrended)")
+        ax.set_title("Accumulated phase from linked tokens (detrended)")
         ax.legend(fontsize=7, ncol=4)
 
     axes[-1].set_xlabel("sample index")
