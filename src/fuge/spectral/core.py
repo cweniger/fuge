@@ -614,6 +614,11 @@ class ChirpTokenizer(nn.Module):
         Range of dlnf grid.  |dlnf| ≤ 0.5 recommended.
     noise_model : NoiseModel or None
         Pre-configured noise model for whitening.
+    start : int or None
+        Sample index where the first window begins.  Default None
+        uses k//4 for dyadic multi-resolution alignment (token
+        boundaries fall on multiples of k/2, nesting across scales).
+        Set to 0 to start at the beginning of the signal.
 
     Output
     ------
@@ -633,13 +638,15 @@ class ChirpTokenizer(nn.Module):
     def __init__(self, k: int = 1024, n_peaks: int = 3,
                  radius: int = 2, n_dlnf: int = 11,
                  dlnf_min: float = 0.0, dlnf_max: float = 0.05,
-                 noise_model: 'NoiseModel | None' = None):
+                 noise_model: 'NoiseModel | None' = None,
+                 start: int = None):
         super().__init__()
         self.stft = DechirpSTFT(k=k)
         self.peak_finder = PeakFinder(stft=self.stft)
         self.noise_model = noise_model
         self.n_peaks = n_peaks
         self.radius = radius
+        self.start = k // 4 if start is None else start
         self.register_buffer(
             "dlnf_grid", torch.linspace(dlnf_min, dlnf_max, n_dlnf))
 
@@ -653,15 +660,8 @@ class ChirpTokenizer(nn.Module):
         return 9
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, start: int = 0) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Tokenize batched time-domain signals into chirp tokens.
-
-        Parameters
-        ----------
-        x : Tensor, shape (B, N)
-        start : int
-            Sample index where the first window begins (default 0).
-            Set to k//4 for dyadic multi-resolution alignment.
 
         Returns
         -------
@@ -673,6 +673,7 @@ class ChirpTokenizer(nn.Module):
         """
         B, N = x.shape
 
+        start = self.start
         X_start, X_end = self.stft(
             x, dlnf=self.dlnf_grid, n_hann_splits=2, start=start)
         X = X_start + X_end
