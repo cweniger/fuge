@@ -55,7 +55,7 @@ class DechirpSTFT(nn.Module):
         self.register_buffer("window_end", ((1 + t) / 2) * self.window)
 
     def forward(self, x: torch.Tensor, dlnf=0.,
-                n_hann_splits: int = 1):
+                n_hann_splits: int = 1, start: int = 0):
         """Compute the de-chirped windowed FFT.
 
         The chirp model is f(t) = f_center · exp(β·t) with t ∈ [-1, 1]
@@ -74,6 +74,11 @@ class DechirpSTFT(nn.Module):
         n_hann_splits : int
             1 (default): return the standard Hann-windowed FFT.
             2: return (X_start, X_end) from weighted sub-windows.
+        start : int
+            Sample index where the first window begins (default 0).
+            Set to k//4 for dyadic multi-resolution alignment: token
+            boundaries then fall on multiples of k/2, which nest
+            cleanly across scales k, k/2, k/4, …
 
         Returns
         -------
@@ -91,7 +96,7 @@ class DechirpSTFT(nn.Module):
         beta = 2.0 * dlnf
 
         # Unfold into overlapping windows: (B, N_WINDOWS, k)
-        raw_windows = x.unfold(dimension=1, size=self.k, step=self.hop)
+        raw_windows = x[:, start:].unfold(dimension=1, size=self.k, step=self.hop)
 
         # Build list of windows to process
         if n_hann_splits == 2:
@@ -646,25 +651,29 @@ class ChirpTokenizer(nn.Module):
         return 9
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start: int = 0) -> torch.Tensor:
         """Tokenize batched time-domain signals into chirp tokens.
 
         Parameters
         ----------
         x : Tensor, shape (B, N)
+        start : int
+            Sample index where the first window begins (default 0).
+            Set to k//4 for dyadic multi-resolution alignment.
 
         Returns
         -------
         tokens : Tensor, shape (B, W, K, 9)
             [snr, t_start, t_end, f_start, f_end, A_start, A_end,
              phase_start, phase_end].
-            t: sample indices.  f: cycles/sample (0–0.5).
+            t: sample indices (absolute, in input signal).
+            f: cycles/sample (0–0.5).
             ps: wrapped (-π,π].  pe: ps + unrolled advance.
         """
         B, N = x.shape
 
         X_start, X_end = self.stft(
-            x, dlnf=self.dlnf_grid, n_hann_splits=2)
+            x, dlnf=self.dlnf_grid, n_hann_splits=2, start=start)
         X = X_start + X_end
 
         if self.noise_model is not None:
@@ -684,8 +693,8 @@ class ChirpTokenizer(nn.Module):
         hop = self.stft.hop
         W = peaks.shape[-3]
         w_idx = torch.arange(W, device=x.device, dtype=x.dtype)
-        t_s = w_idx * hop + k / 4       # sample index of t = -½
-        t_e = w_idx * hop + 3 * k / 4   # sample index of t = +½
+        t_s = start + w_idx * hop + k / 4       # sample index of t = -½
+        t_e = start + w_idx * hop + 3 * k / 4   # sample index of t = +½
         t_start = t_s.unsqueeze(-1).expand_as(freq)
         t_end = t_e.unsqueeze(-1).expand_as(freq)
 
