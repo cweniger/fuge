@@ -52,7 +52,7 @@ Four classes with separated concerns. See `docs/spectral_math.md` for the full m
 
 - **`NoiseModel(nn.Module)`**: Streaming noise PSD estimator. Holds a reference to a `DechirpSTFT`, maintains EMA-updated noise std per (window, freq) bin from pure noise signals. Provides `whiten()` for SNR-based peak detection.
 
-- **`ChirpTokenizer(nn.Module)`**: Thin orchestrator composing `DechirpSTFT`, `PeakFinder`, and optionally `NoiseModel`. Outputs 9-field chirp tokens: `[snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end]` with normalized frequencies and wrapped phases. Adjacent tokens share boundaries for voice formation.
+- **`ChirpTokenizer(nn.Module)`**: Thin orchestrator composing `DechirpSTFT`, `PeakFinder`, and optionally `NoiseModel`. Outputs 9-field chirp tokens: `[snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end]`. Time in sample indices, frequency in cycles/sample (0–0.5), phases unwrapped (pe − ps = phase advance per hop). Accepts `start` parameter for dyadic multi-resolution alignment. Adjacent tokens share boundaries for voice formation.
 
 The `dlnf` parameter is per-hop; `β = 2·dlnf` is the total log-frequency change across the full window. Resampling uses linear interpolation on an exponentially warped time grid: `τ(t) = [exp(β·t) − exp(−β)] / sinh(β) − 1`. |dlnf| ≤ 0.5 supported.
 

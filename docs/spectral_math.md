@@ -395,7 +395,16 @@ Then:
 Note: τ_start and τ_end are not symmetric about 0 for β ≠ 0, so the
 phase errors from propagation are inherently asymmetric.
 
-Final phases are wrapped to [−π, π].
+Both phase_start and phase_end are kept unwrapped (raw model
+predictions from φ_center).  They are defined up to a shared additive
+constant of 2π multiples.  The difference phase_end − phase_start is
+the exact phase advance across one hop, with no modular ambiguity.
+
+Note: phase_start and phase_end are NOT independent measurements.
+Both are derived from a single measurement (φ_center) plus the chirp
+model (freq_ref, dlnf_refined).  The phase advance pe − ps is fully
+determined by freq_ref and dlnf_refined via the warp formula.  The
+only independent phase information per token is φ_center.
 
 ---
 
@@ -433,27 +442,33 @@ magnitudes before inversion to account for fractional bin offset.
 
 Each peak produces a 9-element token:
 
-| Index | Field       | Definition                      | Range        |
-|-------|-------------|---------------------------------|--------------|
-| 0     | snr         | Peak amplitude (whitened)       | [0, ∞)       |
-| 1     | t_start     | Time at t = −½, normalized      | [−1, 1]      |
-| 2     | t_end       | Time at t = +½, normalized      | [−1, 1]      |
-| 3     | f_start     | f(−½), normalized               | [−1, 1]      |
-| 4     | f_end       | f(+½), normalized               | [−1, 1]      |
-| 5     | A_start     | Amplitude at t = −½             | [0, ∞)       |
-| 6     | A_end       | Amplitude at t = +½             | [0, ∞)       |
-| 7     | phase_start | Phase at t = −½                 | [−π, π]      |
-| 8     | phase_end   | Phase at t = +½                 | [−π, π]      |
+| Index | Field       | Definition                           | Units              |
+|-------|-------------|--------------------------------------|--------------------|
+| 0     | snr         | Peak amplitude (SNR when whitened)   | dimensionless      |
+| 1     | t_start     | Sample index at t = −½               | samples            |
+| 2     | t_end       | Sample index at t = +½               | samples            |
+| 3     | f_start     | Frequency at t = −½                  | cycles/sample      |
+| 4     | f_end       | Frequency at t = +½                  | cycles/sample      |
+| 5     | A_start     | Amplitude at t = −½                  | signal units       |
+| 6     | A_end       | Amplitude at t = +½                  | signal units       |
+| 7     | phase_start | Phase at t = −½ (unwrapped)          | radians            |
+| 8     | phase_end   | Phase at t = +½ (unwrapped)          | radians            |
 
-Time normalization: absolute sample position mapped to [−1, 1] over the
-signal length.
+**Time**: absolute sample indices in the input signal.  With
+`start=k/4`, boundaries fall on multiples of k/2 for dyadic
+multi-resolution alignment.
 
-Frequency normalization: bin index mapped to [−1, 1] over [0, Fk−1]
-where Fk = k/2 + 1.
+**Frequency**: cycles per sample (0 to 0.5 at Nyquist).
+Multiply by f_sample to get Hz.
+
+**Phase**: both unwrapped, defined up to a shared 2π constant.
+pe − ps = exact phase advance across one hop (no ambiguity).
+For stitching: pe[w] ≈ ps[w+1] (mod 2π).
+Total voice phase = Σ(pe[w] − ps[w]).
 
 Adjacent windows share boundaries: t_end[w] = t_start[w+1],
 and for clean signals f_end[w] ≈ f_start[w+1],
-phase_end[w] ≈ phase_start[w+1].
+phase_end[w] ≈ phase_start[w+1] (mod 2π).
 
 ---
 
