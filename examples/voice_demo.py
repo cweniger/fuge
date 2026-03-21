@@ -1,11 +1,11 @@
-"""Voice stitching demo: tokenize a chirping signal and stitch into voices."""
+"""Chirp linking demo: tokenize a chirping signal and link into chains."""
 
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
-from fuge.spectral import ChirpTokenizer, VoiceStitcher, VoiceStitchConfig
+from fuge.spectral import ChirpTokenizer, ChirpLinker, ChirpLinkConfig
 
 
 def make_test_signal(N=50_000, f0=0.05, fdot=1e-6, A=5.0, noise_sigma=1.0, seed=42):
@@ -27,12 +27,12 @@ def make_test_signal(N=50_000, f0=0.05, fdot=1e-6, A=5.0, noise_sigma=1.0, seed=
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Voice stitching demo")
+    parser = argparse.ArgumentParser(description="Chirp linking demo")
     parser.add_argument("--sigma", type=float, default=1.0, help="Noise std dev")
     parser.add_argument("--N", type=int, default=50_000, help="Signal length in samples")
     parser.add_argument("--k", type=int, default=1024, help="Window size")
     parser.add_argument("--n-peaks", type=int, default=5, help="Peaks per window")
-    parser.add_argument("--min-length", type=int, default=3, help="Min tokens per voice")
+    parser.add_argument("--min-length", type=int, default=3, help="Min tokens per chain")
     parser.add_argument("--max-df", type=float, default=0.1, help="Frequency match threshold")
     parser.add_argument("--max-dphi", type=float, default=1.0, help="Phase match threshold (rad)")
     parser.add_argument("--max-dA", type=float, default=0.8, help="Amplitude match threshold")
@@ -58,25 +58,35 @@ if __name__ == "__main__":
     tokenizer = ChirpTokenizer(
         k=args.k, n_peaks=args.n_peaks, dlnf_min=0.0, dlnf_max=0.02, n_dlnf=11)
     tokenizer = tokenizer.to(device)
-    tokens = tokenizer(x)  # (1, W, K, 9)
-    print(f"Tokens shape: {tokens.shape}")
+    tokens = tokenizer(x)
+    print(f"Tokens: {tokens}")
 
-    # Stitch into voices
-    config = VoiceStitchConfig(
+    # Link tokens
+    config = ChirpLinkConfig(
         max_df=args.max_df, max_dphi=args.max_dphi, max_dA=args.max_dA)
-    stitcher = VoiceStitcher(config=config, min_length=args.min_length)
-    voices = stitcher(tokens)
+    linker = ChirpLinker(config=config, min_length=args.min_length)
+    linked = linker(tokens)
+    print(f"Linked: {linked}")
 
-    print(f"Found {len(voices[0])} voices")
-    for i, v in enumerate(voices[0]):
-        n_anchors = v.shape[0]
-        print(f"  Voice {i}: {n_anchors} anchors, "
-              f"f range [{v[:, 3].min():.4f}, {v[:, 3].max():.4f}] cycles/sample, "
-              f"total phase advance: {v[-1, 2] - v[0, 2]:.1f} rad")
+    chain_ids = linked.chain_id[0].cpu()
+    unique_chains = chain_ids.unique()
+    n_chains = (unique_chains >= 0).sum().item()
+    print(f"Found {n_chains} chains")
+    for cid in unique_chains:
+        if cid < 0:
+            continue
+        mask = chain_ids == cid
+        n_tok = mask.sum().item()
+        f_vals = linked.f_start[0].cpu()[mask]
+        snr_val = linked.snr[0].cpu()[mask][0].item()
+        print(f"  Chain {int(cid)}: {n_tok} tokens, "
+              f"f=[{f_vals.min():.4f}, {f_vals.max():.4f}], "
+              f"accumulated SNR={snr_val:.1f}")
 
     # Plot
     N = args.N
     t_samples = np.arange(N)
+    lt = linked.data[0].cpu()
     fig, axes = plt.subplots(5, 1, figsize=(14, 16),
                              sharex=True,
                              height_ratios=[1, 1, 1.2, 1.2, 1])
@@ -95,7 +105,7 @@ if __name__ == "__main__":
 
     # Panel 3: Token spectrogram
     ax = axes[2]
-    tok = tokens.data[0].cpu()  # (W, K, 9)
+    tok = tokens.data[0].cpu()
     W, K, _ = tok.shape
     for ki in range(K):
         t_mid = (tok[:, ki, 1] + tok[:, ki, 2]) / 2
@@ -108,34 +118,59 @@ if __name__ == "__main__":
     ax.set_title("Chirp tokens (color = peak amplitude)")
     fig.colorbar(sc, ax=ax, label="peak amplitude")
 
-    # Panel 4: Voices in time-frequency
+    # Panel 4: Linked chains in time-frequency
     ax = axes[3]
-    colors = plt.cm.tab10(np.linspace(0, 1, max(len(voices[0]), 1)))
-    for i, v in enumerate(voices[0]):
-        v_np = v.cpu().numpy()
-        ax.plot(v_np[:, 1], v_np[:, 3], '-o', color=colors[i % len(colors)],
-                ms=2, lw=1.2, label=f"voice {i}")
-    # True frequencies
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n_chains, 1)))
+    ci = 0
+    for cid in unique_chains:
+        if cid < 0:
+            continue
+        mask = chain_ids == cid
+        ws, ks = torch.where(mask)
+        order = ws.argsort()
+        ws, ks = ws[order], ks[order]
+        t_mid = ((lt[ws, ks, 1] + lt[ws, ks, 2]) / 2).numpy()
+        f_mid = ((lt[ws, ks, 3] + lt[ws, ks, 4]) / 2).numpy()
+        ax.plot(t_mid, f_mid, '-o', color=colors[ci % len(colors)],
+                ms=2, lw=1.2, label=f"chain {int(cid)}")
+        ci += 1
     ax.plot(t_samples, f_true1, '--', color='gray', lw=0.5, alpha=0.7, label='true f1')
     ax.plot(t_samples, f_true2, '--', color='silver', lw=0.5, alpha=0.7, label='true f2')
     ax.set_ylabel("f (cycles/sample)")
-    ax.set_title("Stitched voices")
+    ax.set_title("Linked chains")
     ax.legend(fontsize=7, ncol=4)
 
-    # Panel 5: Unwrapped phase for each voice
+    # Panel 5: Accumulated phase (detrended)
     ax = axes[4]
-    for i, v in enumerate(voices[0]):
-        v_np = v.cpu().numpy()
-        # Remove linear trend for visibility
-        phi = v_np[:, 2]
-        t_anchor = v_np[:, 1]
-        if len(t_anchor) > 1:
-            slope = (phi[-1] - phi[0]) / (t_anchor[-1] - t_anchor[0])
-            phi_detrend = phi - slope * (t_anchor - t_anchor[0]) - phi[0]
+    ci = 0
+    for cid in unique_chains:
+        if cid < 0:
+            continue
+        mask = chain_ids == cid
+        ws, ks = torch.where(mask)
+        order = ws.argsort()
+        ws, ks = ws[order], ks[order]
+
+        phi_accum = [lt[ws[0], ks[0], 7].item()]
+        for j in range(len(ws)):
+            ps_j = lt[ws[j], ks[j], 7].item()
+            pe_j = lt[ws[j], ks[j], 8].item()
+            phi_accum.append(phi_accum[-1] + (pe_j - ps_j))
+        phi_accum = np.array(phi_accum)
+
+        t_anchors = [lt[ws[0], ks[0], 1].item()]
+        for j in range(len(ws)):
+            t_anchors.append(lt[ws[j], ks[j], 2].item())
+        t_anchors = np.array(t_anchors)
+
+        if len(t_anchors) > 1:
+            slope = (phi_accum[-1] - phi_accum[0]) / (t_anchors[-1] - t_anchors[0])
+            phi_detrend = phi_accum - slope * (t_anchors - t_anchors[0]) - phi_accum[0]
         else:
-            phi_detrend = phi - phi[0]
-        ax.plot(t_anchor, phi_detrend, '-', color=colors[i % len(colors)],
-                lw=1, label=f"voice {i}")
+            phi_detrend = phi_accum - phi_accum[0]
+        ax.plot(t_anchors, phi_detrend, '-', color=colors[ci % len(colors)],
+                lw=1, label=f"chain {int(cid)}")
+        ci += 1
     ax.set_ylabel("φ − linear trend (rad)")
     ax.set_xlabel("sample index")
     ax.set_title("Coherent phase (detrended)")

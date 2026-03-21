@@ -65,11 +65,7 @@ Structured wrapper around the (B, W, K, C) chirp token tensor with named field a
 
 ### `src/fuge/spectral/legato.py` — `ChirpLinker(nn.Module)`
 
-Links chirp tokens across windows with boundary smoothing.  Shares the DAG-building and chain-resolution logic with `VoiceStitcher`.  For each matched chain: boundary frequencies and amplitudes are averaged to agree, boundary phases are split-corrected for coherence, SNR is replaced with accumulated chain SNR (`sqrt(Σ s_i²)`), and a chain ID is assigned.  Output is `ChirpTokens` with shape (B, W, K, 10) — same layout as input plus `chain_id`, directly usable by downstream transformers.
-
-### `src/fuge/spectral/voice.py` — `VoiceStitcher(nn.Module)`, `VoiceStitchConfig`
-
-Stitches chirp tokens into phase-coherent voices.  Builds a DAG of compatible tokens across adjacent windows (matching on frequency, phase, and amplitude), resolves branching via greedy highest-SNR path selection, and produces anchor-point sequences with coherently unwrapped phase.  Each voice is a `(V+1, 4)` tensor of `[amplitude, time, phase, frequency]` at boundary anchor points.  Phase stitching uses exact within-window advances and wrapped boundary corrections: `φ[i+1] = φ[i] + wrap(φ_start[i] − φ_end[i−1]) + (φ_end[i] − φ_start[i])`.
+Links chirp tokens across windows with boundary smoothing.  Builds a DAG of compatible tokens across adjacent windows (matching on frequency, phase, and amplitude), resolves branching via greedy highest-SNR path selection.  For each matched chain: boundary frequencies and amplitudes are averaged to agree, boundary phases are split-corrected for coherence, SNR is replaced with accumulated chain SNR (`sqrt(Σ s_i²)`), and a chain ID is assigned.  Output is `ChirpTokens` with shape (B, W, K, 10) — same layout as input plus `chain_id`, directly usable by downstream transformers.
 
 ### `src/fuge/spectral/embedding.py` — `ChirpTokenEmbedding(nn.Module)`
 
@@ -102,8 +98,7 @@ fuge/
 │       │   ├── __init__.py          # re-exports all public classes
 │       │   ├── tokens.py            # ChirpTokens
 │       │   ├── core.py              # DechirpSTFT, PeakFinder, NoiseModel, ChirpTokenizer
-│       │   ├── legato.py            # ChirpLinker
-│       │   ├── voice.py             # VoiceStitcher, VoiceStitchConfig
+│       │   ├── legato.py            # ChirpLinker, ChirpLinkConfig
 │       │   └── embedding.py         # ChirpTokenEmbedding
 │       └── svd/
 │           ├── __init__.py          # re-exports: StreamingPCA
