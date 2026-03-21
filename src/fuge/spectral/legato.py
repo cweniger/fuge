@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass
 
-from fuge.spectral.tokens import ChirpTokens, N_BASE
+from fuge.spectral.tokens import ChirpTokens, LinkedChirpTokens, N_BASE
 
 
 @dataclass
@@ -159,8 +159,8 @@ class ChirpLinker(nn.Module):
         self.min_length = min_length
 
     @torch.no_grad()
-    def forward(self, tokens: ChirpTokens) -> ChirpTokens:
-        """Link tokens and return enriched ChirpTokens.
+    def forward(self, tokens: ChirpTokens) -> LinkedChirpTokens:
+        """Link tokens and return LinkedChirpTokens.
 
         Parameters
         ----------
@@ -168,34 +168,40 @@ class ChirpLinker(nn.Module):
 
         Returns
         -------
-        enriched : ChirpTokens with shape (B, W, K, 10)
-            Same fields plus chain_id at index 9.
+        linked : LinkedChirpTokens
+            Same 9-field data (with updated SNR/boundaries) plus
+            a separate chain_id LongTensor (B, W, K).
         """
         B, W, K, C = tokens.shape
         assert C >= N_BASE
 
-        # Append chain_id column initialized to -1.
-        chain_col = torch.full(
-            (B, W, K, 1), -1.0, device=tokens.device, dtype=tokens.dtype)
-        enriched = torch.cat([tokens.data[..., :N_BASE], chain_col], dim=-1)
+        data = tokens.data[..., :N_BASE].clone()
+        chain_id = torch.full(
+            (B, W, K), -1, device=tokens.device, dtype=torch.long)
 
         chain_counter = 0
         for b in range(B):
             chain_counter = self._enrich_single(
-                enriched[b], chain_counter)
+                data[b], chain_id[b], chain_counter)
 
-        return ChirpTokens(enriched)
+        return LinkedChirpTokens(data, chain_id)
 
     def _enrich_single(self, tokens: torch.Tensor,
+                       chain_id: torch.Tensor,
                        chain_counter: int) -> int:
-        """Enrich one batch element in-place: (W, K, 10).
+        """Enrich one batch element in-place.
+
+        Parameters
+        ----------
+        tokens : (W, K, 9) float tensor, modified in-place.
+        chain_id : (W, K) long tensor, modified in-place.
+        chain_counter : current chain ID counter.
 
         Returns updated chain_counter.
         """
         W, K, _ = tokens.shape
 
-        # Use the first 9 fields for DAG building.
-        edges, chains = _build_dag(tokens[..., :N_BASE], self.config)
+        edges, chains = _build_dag(tokens, self.config)
         assignments = _greedy_assign(chains, W)
 
         for w_start, path in assignments:
@@ -205,7 +211,7 @@ class ChirpLinker(nn.Module):
 
             # Assign chain ID.
             for i in range(V):
-                tokens[w_start + i, path[i], 9] = chain_counter
+                chain_id[w_start + i, path[i]] = chain_counter
             chain_counter += 1
 
             # Accumulated SNR: sqrt(sum s_i^2).
