@@ -41,6 +41,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
     noisy, clean, f_true1, f_true2 = make_test_signal(
         N=args.N, noise_sigma=args.sigma, seed=args.seed)
