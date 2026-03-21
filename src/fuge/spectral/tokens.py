@@ -1,13 +1,14 @@
-"""Structured chirp token container.
+"""Structured chirp token containers.
 
-Thin wrapper around a (B, W, K, C) tensor with named field access.
-The underlying tensor stays contiguous and GPU-compatible.
+ChirpTokens: thin wrapper around a (B, W, K, 9) tensor with named field access.
+LinkedChirpTokens: subclass adding a separate (B, W, K) long tensor for chain IDs.
+Both keep the underlying data contiguous and GPU-compatible.
 """
 
 import torch
 
 
-# Field indices for the base 9-field token format.
+# Field indices for the 9-field token format.
 SNR = 0
 T_START = 1
 T_END = 2
@@ -17,10 +18,8 @@ A_START = 5
 A_END = 6
 PHASE_START = 7
 PHASE_END = 8
-CHAIN_ID = 9
 
 N_BASE = 9
-N_LINKED = 10
 
 
 class ChirpTokens:
@@ -36,12 +35,10 @@ class ChirpTokens:
         6: A_end        — amplitude at end boundary
         7: phase_start  — phase at start boundary
         8: phase_end    — phase at end boundary
-        9: chain_id     — linked chain ID (-1 = unlinked), added by ChirpLinker
 
     Parameters
     ----------
-    data : Tensor, shape (B, W, K, C)
-        C >= 9 (base tokens) or C >= 10 (after linking).
+    data : Tensor, shape (B, W, K, 9)
     """
 
     def __init__(self, data: torch.Tensor):
@@ -96,18 +93,45 @@ class ChirpTokens:
     def phase_end(self) -> torch.Tensor:
         return self.data[..., PHASE_END]
 
-    @property
-    def chain_id(self) -> torch.Tensor:
-        """Chain ID (-1 = unlinked). Only available after linking."""
-        assert self.data.shape[-1] >= N_LINKED, \
-            "chain_id not available — run ChirpLinker first"
-        return self.data[..., CHAIN_ID]
-
-    @property
-    def is_linked(self) -> bool:
-        return self.data.shape[-1] >= N_LINKED
-
     def __repr__(self):
         B, W, K, C = self.data.shape
-        linked = ", linked" if self.is_linked else ""
-        return f"ChirpTokens(B={B}, W={W}, K={K}, C={C}{linked})"
+        return f"ChirpTokens(B={B}, W={W}, K={K})"
+
+
+class LinkedChirpTokens(ChirpTokens):
+    """Chirp tokens with chain linking information.
+
+    Extends ChirpTokens with a separate integer chain_id tensor.
+    Tokens in the same chain share a chain_id >= 0; unlinked tokens
+    have chain_id = -1.
+
+    Parameters
+    ----------
+    data : Tensor, shape (B, W, K, 9)
+        Token data (same 9 fields, with updated SNR/boundaries after linking).
+    chain_id : LongTensor, shape (B, W, K)
+        Chain assignment per token. -1 = unlinked.
+    """
+
+    def __init__(self, data: torch.Tensor, chain_id: torch.Tensor):
+        super().__init__(data)
+        assert chain_id.shape == data.shape[:3]
+        assert chain_id.dtype == torch.long
+        self._chain_id = chain_id
+
+    @property
+    def chain_id(self) -> torch.Tensor:
+        return self._chain_id
+
+    @property
+    def n_chains(self) -> int:
+        """Number of distinct chains (excluding unlinked tokens)."""
+        return int((self._chain_id >= 0).any(dim=-1).any(dim=-1).sum()
+                    if self._chain_id.numel() > 0
+                    else 0)
+
+    def __repr__(self):
+        B, W, K, _ = self.data.shape
+        ids = self._chain_id.unique()
+        nc = (ids >= 0).sum().item()
+        return f"LinkedChirpTokens(B={B}, W={W}, K={K}, chains={nc})"
