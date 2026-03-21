@@ -16,7 +16,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
-from fuge.spectral import ChirpTokenizer, VoiceStitcher, VoiceStitchConfig, ChirpLinker
+from fuge.spectral import ChirpTokenizer, ChirpLinker, ChirpLinkConfig
 
 
 def make_emri_signal(N, k, f0, dlnf_per_hop, A, n_harmonics=1,
@@ -158,7 +158,7 @@ if __name__ == "__main__":
     print(f"Tokens: {tokens.shape}")
 
     # Link tokens
-    config = VoiceStitchConfig(max_df=0.05, max_dphi=2.0, max_dA=0.8)
+    config = ChirpLinkConfig(max_df=0.05, max_dphi=2.0, max_dA=0.8)
     linker = ChirpLinker(config=config, min_length=args.min_length)
     linked = linker(tokens)
 
@@ -177,13 +177,9 @@ if __name__ == "__main__":
               f"f=[{f_vals.min():.4f}, {f_vals.max():.4f}], "
               f"accumulated SNR={snr_val:.1f}")
 
-    # Also stitch for voice visualization
-    stitcher = VoiceStitcher(config=config, min_length=args.min_length)
-    voices = stitcher(tokens)
-
     # --- Plot ---
     t_samples = np.arange(N)
-    n_panels = 4 + (1 if len(voices[0]) > 0 else 0)
+    n_panels = 4 + (1 if n_chains > 0 else 0)
     fig, axes = plt.subplots(n_panels, 1, figsize=(12, 3 * n_panels),
                              sharex=True)
 
@@ -222,18 +218,28 @@ if __name__ == "__main__":
     ax.legend(fontsize=6, loc='upper left', ncol=3)
     fig.colorbar(sc, ax=ax, label="peak amplitude")
 
-    # Panel 4: Stitched voices + true frequencies
+    # Panel 4: Linked chains + true frequencies
     ax = axes[3]
-    colors = plt.cm.tab10(np.linspace(0, 1, max(len(voices[0]), 1)))
-    for i, v in enumerate(voices[0]):
-        v_np = v.cpu().numpy()
-        ax.plot(v_np[:, 1], v_np[:, 3], '-o', color=colors[i % len(colors)],
-                ms=3, lw=1.5, label=f"voice {i}")
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n_chains, 1)))
+    lt = linked.data[0].cpu()
+    ci = 0
+    for cid in unique_chains:
+        if cid < 0:
+            continue
+        mask = chain_ids == cid
+        ws, ks = torch.where(mask)
+        order = ws.argsort()
+        ws, ks = ws[order], ks[order]
+        t_mid = ((lt[ws, ks, 1] + lt[ws, ks, 2]) / 2).numpy()
+        f_mid = ((lt[ws, ks, 3] + lt[ws, ks, 4]) / 2).numpy()
+        ax.plot(t_mid, f_mid, '-o', color=colors[ci % len(colors)],
+                ms=3, lw=1.5, label=f"chain {int(cid)}")
+        ci += 1
     for h_idx, f_h in enumerate(all_f_harmonics):
         ax.plot(t_samples, f_h, '--', color='gray', lw=1, alpha=0.5,
                 label=all_source_labels[h_idx])
     ax.set_ylabel("f (cycles/sample)")
-    ax.set_title("Stitched voices vs true frequency")
+    ax.set_title("Linked chains vs true frequency")
     ax.legend(fontsize=7, ncol=4)
 
     # Panel 5: Accumulated phase from linked tokens (detrended)

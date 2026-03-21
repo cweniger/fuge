@@ -3,13 +3,11 @@
 from fuge.spectral.tokens import ChirpTokens
 from fuge.spectral.core import DechirpSTFT, PeakFinder, NoiseModel, ChirpTokenizer
 from fuge.spectral.embedding import ChirpTokenEmbedding
-from fuge.spectral.voice import VoiceStitcher, VoiceStitchConfig
-from fuge.spectral.legato import ChirpLinker
+from fuge.spectral.legato import ChirpLinker, ChirpLinkConfig
 
 __all__ = [
     "ChirpTokens",
     "DechirpSTFT", "PeakFinder", "NoiseModel",
     "ChirpTokenizer", "ChirpTokenEmbedding",
-    "VoiceStitcher", "VoiceStitchConfig",
-    "ChirpLinker",
+    "ChirpLinker", "ChirpLinkConfig",
 ]
