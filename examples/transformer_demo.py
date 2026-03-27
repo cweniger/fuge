@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-from fuge.spectral import (ChirpTokenizer, ChirpTokenEmbedding,
+from fuge.spectral import (ChirpTokenizer, ChirpTokens, ChirpTokenEmbedding,
                            HarmonicEmbeddingConfig, HarmonicPhaseEmbeddingConfig)
 from fuge.nn import TransformerEmbedding
 from chirp import chirp_signal
@@ -107,7 +107,7 @@ def tokenize_signals(signals, tokenizer, device):
         done = min(start + TOKENIZE_BATCH, len(signals))
         if done % 500 == 0 or done == len(signals):
             print(f"  {done}/{len(signals)}")
-    return torch.cat(all_tokens)
+    return ChirpTokens.cat(all_tokens)
 
 
 # =====================================================================

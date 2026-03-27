@@ -59,13 +59,15 @@ Four classes with separated concerns. See `docs/spectral_math.md` for the full m
 
 The `dlnf` parameter is per-hop; `β = 2·dlnf` is the total log-frequency change across the full window. Resampling uses linear interpolation on an exponentially warped time grid: `τ(t) = [exp(β·t) − exp(−β)] / sinh(β) − 1`. |dlnf| ≤ 0.5 supported.
 
-### `src/fuge/spectral/tokens.py` — `ChirpTokens`
+### `src/fuge/spectral/tokens.py` — `ChirpTokens`, `LinkedChirpTokens`
 
-Structured wrapper around the (B, W, K, C) chirp token tensor with named field access (`.snr`, `.f_start`, `.phase_end`, `.chain_id`, etc.).  The underlying tensor stays contiguous and GPU-compatible.  Base tokens have C=9; after linking, C=10 (adds `chain_id`).
+`ChirpTokens`: structured wrapper around the (B, W, K, 9) chirp token tensor with named field access (`.snr`, `.f_start`, `.phase_end`, etc.).  Supports `.cpu()`, `.to(device)`, and `ChirpTokens.cat(list)`.  The underlying tensor stays contiguous and GPU-compatible.
+
+`LinkedChirpTokens(ChirpTokens)`: subclass adding a separate `(B, W, K)` long tensor for chain IDs.  Tokens in the same chain share a `chain_id >= 0`; unlinked tokens have `chain_id = -1`.  Data tensor stays at C=9.
 
 ### `src/fuge/spectral/legato.py` — `ChirpLinker(nn.Module)`
 
-Links chirp tokens across windows with boundary smoothing.  Builds a DAG of compatible tokens across adjacent windows (matching on frequency, phase, and amplitude), resolves branching via greedy highest-SNR path selection.  For each matched chain: boundary frequencies and amplitudes are averaged to agree, boundary phases are split-corrected for coherence, SNR is replaced with accumulated chain SNR (`sqrt(Σ s_i²)`), and a chain ID is assigned.  Output is `ChirpTokens` with shape (B, W, K, 10) — same layout as input plus `chain_id`, directly usable by downstream transformers.
+Links chirp tokens across windows with boundary smoothing.  Builds a DAG of compatible tokens across adjacent windows (matching on frequency, phase, and amplitude), resolves branching via greedy highest-SNR² path selection.  For each matched chain: boundary frequencies and amplitudes are averaged to agree, boundary phases are split-corrected for coherence, SNR is replaced with accumulated chain SNR (`sqrt(Σ s_i²)`), and a chain ID is assigned.  Output is `LinkedChirpTokens` with data shape (B, W, K, 9) plus a separate chain_id tensor.
 
 ### `src/fuge/spectral/embedding.py` — `HarmonicEmbeddingConfig`, `HarmonicEmbedding`, `HarmonicPhaseEmbeddingConfig`, `HarmonicPhaseEmbedding`, `ChirpTokenEmbedding`
 

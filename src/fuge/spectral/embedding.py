@@ -59,6 +59,13 @@ class HarmonicEmbeddingConfig:
     resolution: float
     modes_per_octave: int = 1
 
+    def __post_init__(self):
+        assert self.v_max > self.v_min, f"v_max must be > v_min, got {self.v_max} <= {self.v_min}"
+        assert self.resolution > 0, f"resolution must be > 0, got {self.resolution}"
+        assert self.modes_per_octave >= 1, f"modes_per_octave must be >= 1, got {self.modes_per_octave}"
+        R = self.v_max - self.v_min
+        assert self.resolution <= R, f"resolution must be <= range ({R}), got {self.resolution}"
+
     @property
     def n_harmonics(self):
         R = self.v_max - self.v_min
@@ -136,6 +143,10 @@ class HarmonicPhaseEmbeddingConfig:
     """
     phi_max: float
     phi_resolution: float
+
+    def __post_init__(self):
+        assert self.phi_max > 0, f"phi_max must be > 0, got {self.phi_max}"
+        assert self.phi_resolution > 0, f"phi_resolution must be > 0, got {self.phi_resolution}"
 
     @property
     def n_low(self):
