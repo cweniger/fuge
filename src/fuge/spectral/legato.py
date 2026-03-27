@@ -90,27 +90,32 @@ def _build_dag(tokens: torch.Tensor, cfg: ChirpLinkConfig
                 window_edges.append((kp, kn))
         edges.append(window_edges)
 
-    # DP: best chain ending at each (w, k).
+    # DP: best chain ending at each (w, k), accumulating SNR².
+    # Using SNR² so greedy selection maximizes sqrt(Σ s_i²),
+    # consistent with the enrichment step.
     chains: dict[tuple[int, int], tuple[float, list[int]]] = {}
 
     for k_idx in range(K):
         if snr[0, k_idx] > 0:
-            chains[(0, k_idx)] = (snr[0, k_idx].item(), [k_idx])
+            s = snr[0, k_idx].item()
+            chains[(0, k_idx)] = (s * s, [k_idx])
 
     for w in range(W - 1):
         for kp, kn in edges[w]:
             if (w, kp) not in chains:
                 continue
-            prev_snr, prev_path = chains[(w, kp)]
-            new_snr = prev_snr + snr[w + 1, kn].item()
-            if (w + 1, kn) not in chains or chains[(w + 1, kn)][0] < new_snr:
-                chains[(w + 1, kn)] = (new_snr, prev_path + [kn])
+            prev_snr_sq, prev_path = chains[(w, kp)]
+            s = snr[w + 1, kn].item()
+            new_snr_sq = prev_snr_sq + s * s
+            if (w + 1, kn) not in chains or chains[(w + 1, kn)][0] < new_snr_sq:
+                chains[(w + 1, kn)] = (new_snr_sq, prev_path + [kn])
 
     # Seed unreached tokens.
     for w in range(1, W):
         for k_idx in range(K):
             if snr[w, k_idx] > 0 and (w, k_idx) not in chains:
-                chains[(w, k_idx)] = (snr[w, k_idx].item(), [k_idx])
+                s = snr[w, k_idx].item()
+                chains[(w, k_idx)] = (s * s, [k_idx])
 
     return edges, chains
 

@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-from fuge.spectral import (ChirpTokenizer, ChirpTokenEmbedding,
+from fuge.spectral import (ChirpTokenizer, ChirpTokens, ChirpTokenEmbedding,
                            HarmonicEmbeddingConfig, HarmonicPhaseEmbeddingConfig,
                            NoiseModel, DechirpSTFT)
 from fuge.nn import TransformerEmbedding
@@ -247,7 +247,7 @@ def tokenize_signals(signals, tokenizer, device):
         done = min(start + TOKENIZE_BATCH, len(signals))
         if done % 1000 == 0 or done == len(signals):
             print(f"  {done}/{len(signals)}")
-    return torch.cat(all_tokens)
+    return ChirpTokens.cat(all_tokens)
 
 
 # =====================================================================

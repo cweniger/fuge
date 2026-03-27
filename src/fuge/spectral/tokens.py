@@ -57,6 +57,19 @@ class ChirpTokens:
     def dtype(self):
         return self.data.dtype
 
+    def cpu(self):
+        """Return a new ChirpTokens on CPU."""
+        return type(self)(self.data.cpu())
+
+    def to(self, *args, **kwargs):
+        """Return a new ChirpTokens on the specified device/dtype."""
+        return type(self)(self.data.to(*args, **kwargs))
+
+    @classmethod
+    def cat(cls, token_list, dim=0):
+        """Concatenate a list of ChirpTokens along the given dimension."""
+        return cls(torch.cat([t.data for t in token_list], dim=dim))
+
     @property
     def snr(self) -> torch.Tensor:
         return self.data[..., SNR]
@@ -119,6 +132,22 @@ class LinkedChirpTokens(ChirpTokens):
         assert chain_id.dtype == torch.long
         self._chain_id = chain_id
 
+    def cpu(self):
+        return LinkedChirpTokens(self.data.cpu(), self._chain_id.cpu())
+
+    def to(self, *args, **kwargs):
+        return LinkedChirpTokens(
+            self.data.to(*args, **kwargs),
+            self._chain_id.to(*args, **kwargs),
+        )
+
+    @classmethod
+    def cat(cls, token_list, dim=0):
+        return cls(
+            torch.cat([t.data for t in token_list], dim=dim),
+            torch.cat([t._chain_id for t in token_list], dim=dim),
+        )
+
     @property
     def chain_id(self) -> torch.Tensor:
         return self._chain_id
@@ -126,12 +155,11 @@ class LinkedChirpTokens(ChirpTokens):
     @property
     def n_chains(self) -> int:
         """Number of distinct chains (excluding unlinked tokens)."""
-        return int((self._chain_id >= 0).any(dim=-1).any(dim=-1).sum()
-                    if self._chain_id.numel() > 0
-                    else 0)
+        if self._chain_id.numel() == 0:
+            return 0
+        ids = self._chain_id[self._chain_id >= 0]
+        return int(ids.unique().numel())
 
     def __repr__(self):
         B, W, K, _ = self.data.shape
-        ids = self._chain_id.unique()
-        nc = (ids >= 0).sum().item()
-        return f"LinkedChirpTokens(B={B}, W={W}, K={K}, chains={nc})"
+        return f"LinkedChirpTokens(B={B}, W={W}, K={K}, chains={self.n_chains})"
