@@ -12,7 +12,8 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-from fuge.spectral import ChirpTokenizer, ChirpTokenEmbedding
+from fuge.spectral import (ChirpTokenizer, ChirpTokenEmbedding,
+                           HarmonicEmbeddingConfig, HarmonicPhaseEmbeddingConfig)
 from fuge.nn import TransformerEmbedding
 from chirp import chirp_signal
 
@@ -52,9 +53,11 @@ N_LAYERS = 3
 D_FF = 256
 DROPOUT = 0.1
 
-# ── Embedding ────────────────────────────────────────────────────────
-PHASE_MODE = "center"        # "center" or "boundary"
-MASK_PHASES = False          # zero out phase features (for ablation)
+# ── Harmonic embedding configs ───────────────────────────────────────
+EMB_TIME  = HarmonicEmbeddingConfig(v_min=0, v_max=N, resolution=K_WINDOW/2)
+EMB_FREQ  = HarmonicEmbeddingConfig(v_min=0, v_max=0.5, resolution=1/K_WINDOW)
+EMB_AMP   = HarmonicEmbeddingConfig(v_min=0, v_max=100.0, resolution=0.1)
+EMB_PHASE = HarmonicPhaseEmbeddingConfig(phi_max=2*N*0.5, phi_resolution=0.01)
 
 # ── Training ────────────────────────────────────────────────────────
 BATCH_SIZE = 64
@@ -291,9 +294,10 @@ if __name__ == "__main__":
     print(f"  Token shape: {train_tokens.shape}")
 
     # 4. Build token embedding and compute normalization
-    token_emb = ChirpTokenEmbedding(phase_mode=PHASE_MODE,
-                                      mask_phases=MASK_PHASES).double().to(device)
-    token_emb.compute_normalization(train_tokens)
+    token_emb = ChirpTokenEmbedding(
+        time=EMB_TIME, freq=EMB_FREQ,
+        amp=EMB_AMP, phase=EMB_PHASE,
+    ).double().to(device)
 
     # Move raw tokens to CPU for DataLoader
     train_tokens = train_tokens.cpu()

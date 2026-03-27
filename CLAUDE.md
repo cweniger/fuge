@@ -67,9 +67,13 @@ Structured wrapper around the (B, W, K, C) chirp token tensor with named field a
 
 Links chirp tokens across windows with boundary smoothing.  Builds a DAG of compatible tokens across adjacent windows (matching on frequency, phase, and amplitude), resolves branching via greedy highest-SNR path selection.  For each matched chain: boundary frequencies and amplitudes are averaged to agree, boundary phases are split-corrected for coherence, SNR is replaced with accumulated chain SNR (`sqrt(Σ s_i²)`), and a chain ID is assigned.  Output is `ChirpTokens` with shape (B, W, K, 10) — same layout as input plus `chain_id`, directly usable by downstream transformers.
 
-### `src/fuge/spectral/embedding.py` — `ChirpTokenEmbedding(nn.Module)`
+### `src/fuge/spectral/embedding.py` — `HarmonicEmbeddingConfig`, `HarmonicEmbedding`, `HarmonicPhaseEmbeddingConfig`, `HarmonicPhaseEmbedding`, `ChirpTokenEmbedding`
 
-Transforms raw chirp tokens (snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end) into model-ready embedded features with z-score normalization. SNR is peak amplitude from the (optionally whitened) STFT. Time and frequency boundaries tile the signal; boundary amplitudes are recovered via weighted FFTs with complementary time weights. (Was `ToneTokenEmbedding`.)
+`HarmonicEmbedding(nn.Module)`: maps a bounded scalar to `2*n_harmonics` features via sin/cos harmonics.  Configured by `HarmonicEmbeddingConfig(v_min, v_max, resolution, modes_per_octave=1)`.  Frequencies are log-uniformly spaced from `2π/range` to `2π/resolution`; with `modes_per_octave > 1` they become incommensurate (not powers of 2), giving smoother dot-product kernels.
+
+`HarmonicPhaseEmbedding(nn.Module)`: specialized embedding for unwrapped phase.  Anchored at `sin(φ), cos(φ)` (the natural period), with powers of 2 extending downward (sub-harmonics for unwrapped phase comparison across many cycles) and upward (super-harmonics for fine wrapped-phase matching).  Configured by `HarmonicPhaseEmbeddingConfig(phi_max, phi_resolution)`.
+
+`ChirpTokenEmbedding(nn.Module)`: takes three `HarmonicEmbeddingConfig` (time, freq, amp) and one `HarmonicPhaseEmbeddingConfig` (phase).  Applies harmonic embeddings to all 8 boundary fields (_start, _end for t, f, A, phase) plus log1p(SNR) as a scalar.  Output dim = `sum(2 * cfg.n_embed for cfg in [time, freq, amp]) + 2 * phase.n_embed + 1`.  No z-score normalization needed.
 
 ### `src/fuge/svd/core.py` — `StreamingPCA(nn.Module)`
 
