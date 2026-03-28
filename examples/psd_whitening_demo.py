@@ -17,7 +17,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-from fuge.spectral import ChirpTokenizer, ChirpTokenEmbedding, NoiseModel, DechirpSTFT
+from fuge.spectral import (ChirpTokenizer, ChirpTokens, ChirpTokenEmbedding,
+                           HarmonicEmbeddingConfig, HarmonicPhaseEmbeddingConfig,
+                           NoiseModel, DechirpSTFT)
 from fuge.nn import TransformerEmbedding
 
 # ── Signal parameters ────────────────────────────────────────────────
@@ -54,7 +56,12 @@ N_HEADS = 4
 N_LAYERS = 3
 D_FF = 256
 DROPOUT = 0.1
-PHASE_MODE = "center"
+
+# ── Harmonic embedding configs ───────────────────────────────────────
+EMB_TIME  = HarmonicEmbeddingConfig(v_min=0, v_max=N, resolution=K_WINDOW/2)
+EMB_FREQ  = HarmonicEmbeddingConfig(v_min=0, v_max=0.5, resolution=1/K_WINDOW)
+EMB_AMP   = HarmonicEmbeddingConfig(v_min=0, v_max=100.0, resolution=0.1)
+EMB_PHASE = HarmonicPhaseEmbeddingConfig(phi_max=2*N*0.5, phi_resolution=0.01)
 
 # ── Training ─────────────────────────────────────────────────────────
 BATCH_SIZE = 64
@@ -240,7 +247,7 @@ def tokenize_signals(signals, tokenizer, device):
         done = min(start + TOKENIZE_BATCH, len(signals))
         if done % 1000 == 0 or done == len(signals):
             print(f"  {done}/{len(signals)}")
-    return torch.cat(all_tokens)
+    return ChirpTokens.cat(all_tokens)
 
 
 # =====================================================================
@@ -271,7 +278,7 @@ class chirpModel(nn.Module):
             nn.Sigmoid(),
         )
     def forward(self, x):
-        embedded, _, _ = self.token_emb(x)
+        embedded = self.token_emb(x)
         return self.head(self.backbone(embedded))
 
 
@@ -328,8 +335,10 @@ def evaluate(model, val_loader, device):
 
 def build_and_train(train_tokens, val_tokens, train_params, val_params,
                     device, label):
-    token_emb = ChirpTokenEmbedding(phase_mode=PHASE_MODE).double().to(device)
-    token_emb.compute_normalization(train_tokens)
+    token_emb = ChirpTokenEmbedding(
+        time=EMB_TIME, freq=EMB_FREQ,
+        amp=EMB_AMP, phase=EMB_PHASE,
+    ).double().to(device)
 
     train_targets = torch.from_numpy(
         (train_params - PARAM_MIN) / (PARAM_MAX - PARAM_MIN)).double()

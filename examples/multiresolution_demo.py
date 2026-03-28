@@ -93,7 +93,7 @@ def tokenize_multi(signal, k_values, n_peaks, n_dlnf, dlnf_min, dlnf_max,
             k=k, n_peaks=n_peaks, n_dlnf=n_dlnf,
             dlnf_min=dlnf_min, dlnf_max=dlnf_max,
         ).double()
-        tok = tokenizer(x)[0].numpy()  # (W, K, 9)
+        tok = tokenizer(x).data[0].numpy()  # (N, 9)
 
         if f_max is not None:
             # f_start, f_end are in [-1, 1] mapping to [0, Fk-1] bins
@@ -102,15 +102,15 @@ def tokenize_multi(signal, k_values, n_peaks, n_dlnf, dlnf_min, dlnf_max,
             f_max_bin = f_max * k  # cycles/sample -> bin index
             f_max_norm = 2.0 * f_max_bin / (Fk - 1) - 1.0
             # Zero SNR for peaks whose center frequency exceeds f_max
-            f_center = (tok[:, :, 3] + tok[:, :, 4]) / 2
+            f_center = (tok[:, 3] + tok[:, 4]) / 2
             above = f_center > f_max_norm
             tok[above, 0] = 0.0
             n_killed = np.sum(above)
-            n_total = tok.shape[0] * tok.shape[1]
-            print(f"  k={k:4d}: {tok.shape[0]} windows "
-                  f"({n_killed}/{n_total} peaks above f_max={f_max:.4f})")
+            n_total = tok.shape[0]
+            print(f"  k={k:4d}: {n_total} tokens "
+                  f"({n_killed} above f_max={f_max:.4f})")
         else:
-            print(f"  k={k:4d}: {tok.shape[0]} windows")
+            print(f"  k={k:4d}: {tok.shape[0]} tokens")
 
         tokens_by_k[k] = tok
     return tokens_by_k
@@ -125,28 +125,35 @@ def greedy_select(tokens_by_k, k_values):
     k_min = min(k_values)
     hop_min = k_min // 2
 
-    # Best peak per window at finest resolution
-    tok_fine = tokens_by_k[k_min]  # (W_fine, K, 9)
+    # Group flat tokens by window (using t_start), pick best peak per window.
+    def _best_per_window(tok):
+        """Return (W, 9) array: best-SNR token per window from flat (N, 9)."""
+        unique_t = np.unique(tok[:, 1])
+        best = []
+        for t_s in unique_t:
+            group = tok[tok[:, 1] == t_s]
+            best.append(group[np.argmax(group[:, 0])])
+        return np.array(best)
+
+    tok_fine = _best_per_window(tokens_by_k[k_min])  # (W_fine, 9)
     W_fine = tok_fine.shape[0]
 
     # Per fine slot: track (k, window_idx, snr, token_vector)
     slot_k = np.full(W_fine, k_min, dtype=int)
     slot_w = np.arange(W_fine, dtype=int)
-    best_peaks = np.argmax(tok_fine[:, :, 0], axis=1)
-    slot_snr = np.array([tok_fine[w, best_peaks[w], 0] for w in range(W_fine)])
-    slot_token = np.array([tok_fine[w, best_peaks[w], :] for w in range(W_fine)])
+    slot_snr = tok_fine[:, 0].copy()
+    slot_token = tok_fine.copy()
 
     # Upgrade through coarser resolutions
     for k in sorted(k_values):
         if k == k_min:
             continue
 
-        tok = tokens_by_k[k]
+        tok = _best_per_window(tokens_by_k[k])  # (W_coarse, 9)
         ratio = k // k_min  # fine slots per coarse window
 
         for w in range(tok.shape[0]):
-            best_p = np.argmax(tok[w, :, 0])
-            coarse_snr = tok[w, best_p, 0]
+            coarse_snr = tok[w, 0]
 
             fine_start = w * ratio
             fine_end = fine_start + ratio
@@ -160,7 +167,7 @@ def greedy_select(tokens_by_k, k_values):
                 slot_k[fine_start:fine_end] = k
                 slot_w[fine_start:fine_end] = w
                 slot_snr[fine_start:fine_end] = coarse_snr
-                slot_token[fine_start:fine_end] = tok[w, best_p, :]
+                slot_token[fine_start:fine_end] = tok[w, :]
 
     return slot_k, slot_w, slot_snr, slot_token, W_fine
 
@@ -196,20 +203,20 @@ def _synthesize_window(tok, k):
 
 def _reconstruct_single_k(tokens_k, k, N_signal):
     """Standard COLA overlap-add reconstruction for a single window size."""
-    hop = k // 2
-    W = tokens_k.shape[0]
     window = torch.hann_window(k, dtype=torch.float64).numpy()
     signal = np.zeros(N_signal)
     norm = np.zeros(N_signal)
 
-    for w in range(W):
-        start = w * hop
+    # Group flat tokens by window, pick best SNR per window
+    unique_t = np.unique(tokens_k[:, 1])
+    for t_s in unique_t:
+        start = int(t_s - k / 4)
         end = start + k
         if end > N_signal:
             break
-        # Use best peak
-        best_p = np.argmax(tokens_k[w, :, 0])
-        wave = _synthesize_window(tokens_k[w, best_p, :], k)
+        group = tokens_k[tokens_k[:, 1] == t_s]
+        best = group[np.argmax(group[:, 0])]
+        wave = _synthesize_window(best, k)
         signal[start:end] += wave * window
         norm[start:end] += window
 
