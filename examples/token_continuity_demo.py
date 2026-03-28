@@ -62,7 +62,7 @@ def main():
     ).double()
 
     tokens = tokenizer(x)  # (1, W, K, 9)
-    tokens = tokens[0, :, 0, :]  # (W, 9) — first (only) peak
+    tokens = tokens.data[0, :, 0, :]  # (W, 9) — first (only) peak
     W = tokens.shape[0]
     print(f"  {W} windows, token shape per peak: {tokens.shape}")
 

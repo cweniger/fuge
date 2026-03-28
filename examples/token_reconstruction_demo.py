@@ -156,7 +156,7 @@ def main():
     ).double()
 
     tokens = tokenizer(x)  # (1, W, K, 9)
-    tokens = tokens[0].numpy()  # (W, K, 9)
+    tokens = tokens.data[0].numpy()  # (W, K, 9)
     W, K, _ = tokens.shape
     print(f"  {W} windows, {K} peaks/window")
 
