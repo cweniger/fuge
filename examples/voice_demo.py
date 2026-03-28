@@ -107,14 +107,12 @@ if __name__ == "__main__":
     # Panel 3: Token spectrogram
     ax = axes[2]
     tok = tokens.data[0].cpu()
-    W, K, _ = tok.shape
-    for ki in range(K):
-        t_mid = (tok[:, ki, 1] + tok[:, ki, 2]) / 2
-        f_mid = (tok[:, ki, 3] + tok[:, ki, 4]) / 2
-        snr = tok[:, ki, 0]
-        mask = snr > 0
-        sc = ax.scatter(t_mid[mask], f_mid[mask], c=snr[mask], s=3,
-                        cmap="inferno", vmin=0)
+    t_mid = (tok[:, 1] + tok[:, 2]) / 2
+    f_mid = (tok[:, 3] + tok[:, 4]) / 2
+    snr_vals = tok[:, 0]
+    mask = snr_vals > 0
+    sc = ax.scatter(t_mid[mask], f_mid[mask], c=snr_vals[mask], s=3,
+                    cmap="inferno", vmin=0)
     ax.set_ylabel("f (cycles/sample)")
     ax.set_title("Chirp tokens (color = peak amplitude)")
     fig.colorbar(sc, ax=ax, label="peak amplitude")
@@ -127,11 +125,12 @@ if __name__ == "__main__":
         if cid < 0:
             continue
         mask = chain_ids == cid
-        ws, ks = torch.where(mask)
-        order = ws.argsort()
-        ws, ks = ws[order], ks[order]
-        t_mid = ((lt[ws, ks, 1] + lt[ws, ks, 2]) / 2).numpy()
-        f_mid = ((lt[ws, ks, 3] + lt[ws, ks, 4]) / 2).numpy()
+        idxs = torch.where(mask)[0]
+        # Sort by t_start to get temporal order
+        order = lt[idxs, 1].argsort()
+        idxs = idxs[order]
+        t_mid = ((lt[idxs, 1] + lt[idxs, 2]) / 2).numpy()
+        f_mid = ((lt[idxs, 3] + lt[idxs, 4]) / 2).numpy()
         ax.plot(t_mid, f_mid, '-o', color=colors[ci % len(colors)],
                 ms=2, lw=1.2, label=f"chain {int(cid)}")
         ci += 1
@@ -148,20 +147,20 @@ if __name__ == "__main__":
         if cid < 0:
             continue
         mask = chain_ids == cid
-        ws, ks = torch.where(mask)
-        order = ws.argsort()
-        ws, ks = ws[order], ks[order]
+        idxs = torch.where(mask)[0]
+        order = lt[idxs, 1].argsort()
+        idxs = idxs[order]
 
-        phi_accum = [lt[ws[0], ks[0], 7].item()]
-        for j in range(len(ws)):
-            ps_j = lt[ws[j], ks[j], 7].item()
-            pe_j = lt[ws[j], ks[j], 8].item()
+        phi_accum = [lt[idxs[0], 7].item()]
+        for j in range(len(idxs)):
+            ps_j = lt[idxs[j], 7].item()
+            pe_j = lt[idxs[j], 8].item()
             phi_accum.append(phi_accum[-1] + (pe_j - ps_j))
         phi_accum = np.array(phi_accum)
 
-        t_anchors = [lt[ws[0], ks[0], 1].item()]
-        for j in range(len(ws)):
-            t_anchors.append(lt[ws[j], ks[j], 2].item())
+        t_anchors = [lt[idxs[0], 1].item()]
+        for j in range(len(idxs)):
+            t_anchors.append(lt[idxs[j], 2].item())
         t_anchors = np.array(t_anchors)
 
         if len(t_anchors) > 1:

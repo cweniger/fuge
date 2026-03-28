@@ -1,4 +1,4 @@
-"""Chirp token embedding: raw (B, W, K, 9) tokens -> (B, W*K, n_embed).
+"""Chirp token embedding: raw (B, N, 9) tokens -> (B, N, n_embed).
 
 Transforms raw chirp token features via harmonic embeddings — multi-scale
 sin/cos representations that give the network sensitivity at all relevant
@@ -241,20 +241,17 @@ class ChirpTokenEmbedding(nn.Module):
         )
 
     def forward(self, raw_tokens):
-        """Embed and flatten peaks into sequence.
+        """Embed chirp tokens.
 
         Parameters
         ----------
-        raw_tokens : ChirpTokens or Tensor, shape (B, W, K, C)
+        raw_tokens : ChirpTokens or Tensor, shape (B, N, C)
 
         Returns
         -------
-        embedded : Tensor, shape (B, W*K, n_embed)
-        n_windows : int
-        n_peaks : int
+        embedded : Tensor, shape (B, N, n_embed)
         """
         raw_tokens = _to_tensor(raw_tokens)
-        B, W, K, _ = raw_tokens.shape
 
         snr = torch.log1p(raw_tokens[..., 0:1])
 
@@ -270,8 +267,7 @@ class ChirpTokenEmbedding(nn.Module):
         ph_s = self.embed_phase(raw_tokens[..., 7])
         ph_e = self.embed_phase(raw_tokens[..., 8])
 
-        embedded = torch.cat(
+        return torch.cat(
             [snr, t_s, t_e, f_s, f_e, a_s, a_e, ph_s, ph_e],
             dim=-1,
         )
-        return embedded.reshape(B, W * K, self.n_embed), W, K

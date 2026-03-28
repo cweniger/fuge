@@ -1,7 +1,7 @@
 """Structured chirp token containers.
 
-ChirpTokens: thin wrapper around a (B, W, K, 9) tensor with named field access.
-LinkedChirpTokens: subclass adding a separate (B, W, K) long tensor for chain IDs.
+ChirpTokens: thin wrapper around a (B, N, 9) tensor with named field access.
+LinkedChirpTokens: subclass adding a separate (B, N) long tensor for chain IDs.
 Both keep the underlying data contiguous and GPU-compatible.
 """
 
@@ -38,11 +38,11 @@ class ChirpTokens:
 
     Parameters
     ----------
-    data : Tensor, shape (B, W, K, 9)
+    data : Tensor, shape (B, N, 9)
     """
 
     def __init__(self, data: torch.Tensor):
-        assert data.ndim == 4 and data.shape[-1] >= N_BASE
+        assert data.ndim == 3 and data.shape[-1] >= N_BASE
         self.data = data
 
     @property
@@ -107,8 +107,8 @@ class ChirpTokens:
         return self.data[..., PHASE_END]
 
     def __repr__(self):
-        B, W, K, C = self.data.shape
-        return f"ChirpTokens(B={B}, W={W}, K={K})"
+        B, N, C = self.data.shape
+        return f"ChirpTokens(B={B}, N={N})"
 
 
 class LinkedChirpTokens(ChirpTokens):
@@ -120,15 +120,15 @@ class LinkedChirpTokens(ChirpTokens):
 
     Parameters
     ----------
-    data : Tensor, shape (B, W, K, 9)
+    data : Tensor, shape (B, N, 9)
         Token data (same 9 fields, with updated SNR/boundaries after linking).
-    chain_id : LongTensor, shape (B, W, K)
+    chain_id : LongTensor, shape (B, N)
         Chain assignment per token. -1 = unlinked.
     """
 
     def __init__(self, data: torch.Tensor, chain_id: torch.Tensor):
         super().__init__(data)
-        assert chain_id.shape == data.shape[:3]
+        assert chain_id.shape == data.shape[:2]
         assert chain_id.dtype == torch.long
         self._chain_id = chain_id
 
@@ -161,5 +161,5 @@ class LinkedChirpTokens(ChirpTokens):
         return int(ids.unique().numel())
 
     def __repr__(self):
-        B, W, K, _ = self.data.shape
-        return f"LinkedChirpTokens(B={B}, W={W}, K={K}, chains={self.n_chains})"
+        B, N, _ = self.data.shape
+        return f"LinkedChirpTokens(B={B}, N={N}, chains={self.n_chains})"

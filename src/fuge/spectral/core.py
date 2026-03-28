@@ -667,7 +667,7 @@ class ChirpTokenizer(nn.Module):
 
         Returns
         -------
-        tokens : ChirpTokens, shape (B, W, K, 9)
+        tokens : ChirpTokens, shape (B, N, 9) where N = W * n_peaks
             Fields: snr, t_start, t_end, f_start, f_end, A_start, A_end,
             phase_start, phase_end.
             t: sample indices.  f: cycles/sample (0–0.5).
@@ -714,7 +714,8 @@ class ChirpTokenizer(nn.Module):
         # pe - ps is the exact phase advance across one hop
         # (no modular ambiguity, ≈ 2π · f_center · hop for non-chirped).
 
+        # Stack fields: (B, W, K, 9), then flatten W*K -> N.
         data = torch.stack(
             [snr, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe], dim=-1)
-
-        return ChirpTokens(data)
+        B = data.shape[0]
+        return ChirpTokens(data.reshape(B, -1, 9))
