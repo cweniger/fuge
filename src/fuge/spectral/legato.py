@@ -7,8 +7,9 @@ amplitude continuity), links them into chains, and enriches the tokens:
 - SNR is replaced with accumulated chain SNR: sqrt(sum s_i^2).
 - A chain ID is assigned to each token.
 
-The output has the same (B, W, K) layout as the input, with one extra
-field (chain_id), making it directly usable by downstream transformers.
+Input and output are flat (B, N, 9) ChirpTokens.  Window structure is
+recovered from t_start values (tokens from the same window share the
+same t_start).
 """
 
 import torch
@@ -41,106 +42,127 @@ def _wrap(x: torch.Tensor) -> torch.Tensor:
     return (x + torch.pi) % (2 * torch.pi) - torch.pi
 
 
-def _build_dag(tokens: torch.Tensor, cfg: ChirpLinkConfig
+def _group_by_window(tokens: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Group flat tokens (N, C) by window using t_start values.
+
+    Returns
+    -------
+    window_times : sorted unique t_start values
+    groups : list of 1D index tensors, one per window
+    """
+    t_start = tokens[:, 1]
+    window_times, inverse = t_start.unique(sorted=True, return_inverse=True)
+    groups = []
+    for w in range(len(window_times)):
+        groups.append((inverse == w).nonzero(as_tuple=True)[0])
+    return window_times, groups
+
+
+def _build_dag(tokens: torch.Tensor, groups: list[torch.Tensor],
+               cfg: ChirpLinkConfig
                ) -> tuple[list[list[tuple[int, int]]], dict]:
     """Build DAG of compatible tokens and resolve into chains.
 
     Parameters
     ----------
-    tokens : (W, K, C) tensor for a single batch element (C >= 9).
+    tokens : (N, C) tensor for a single batch element (C >= 9).
+    groups : list of index tensors per window.
     cfg : matching thresholds.
 
     Returns
     -------
-    edges : list of list of (k_prev, k_next) per window boundary.
-    chains : dict mapping (w, k) -> (total_snr, [path]).
+    edges : list of list of (idx_prev, idx_next) per window boundary.
+        Indices are flat into the (N,) dimension.
+    chains : dict mapping flat_idx -> (total_snr_sq, [path of flat indices]).
     """
-    W, K = tokens.shape[0], tokens.shape[1]
+    W = len(groups)
 
-    snr = tokens[..., 0]
-    f_start = tokens[..., 3]
-    f_end = tokens[..., 4]
-    A_start = tokens[..., 5]
-    A_end = tokens[..., 6]
-    ps = tokens[..., 7]
-    pe = tokens[..., 8]
+    snr = tokens[:, 0]
+    f_start = tokens[:, 3]
+    f_end = tokens[:, 4]
+    A_start = tokens[:, 5]
+    A_end = tokens[:, 6]
+    ps = tokens[:, 7]
+    pe = tokens[:, 8]
 
     edges = []
     for w in range(W - 1):
         window_edges = []
-        for kp in range(K):
-            if snr[w, kp] <= 0:
+        for ip in groups[w]:
+            ip = ip.item()
+            if snr[ip] <= 0:
                 continue
-            for kn in range(K):
-                if snr[w + 1, kn] <= 0:
+            for in_ in groups[w + 1]:
+                in_ = in_.item()
+                if snr[in_] <= 0:
                     continue
-                fe = f_end[w, kp]
-                fs = f_start[w + 1, kn]
+                fe = f_end[ip]
+                fs = f_start[in_]
                 f_mean = (fe + fs) / 2
                 if f_mean > 0 and abs(fe - fs) / f_mean > cfg.max_df:
                     continue
-                dphi = _wrap(ps[w + 1, kn] - pe[w, kp])
+                dphi = _wrap(ps[in_] - pe[ip])
                 if abs(dphi) > cfg.max_dphi:
                     continue
-                ae = A_end[w, kp]
-                an = A_start[w + 1, kn]
+                ae = A_end[ip]
+                an = A_start[in_]
                 a_max = max(ae, an)
                 if a_max > 0 and abs(ae - an) / a_max > cfg.max_dA:
                     continue
-                window_edges.append((kp, kn))
+                window_edges.append((ip, in_))
         edges.append(window_edges)
 
-    # DP: best chain ending at each (w, k), accumulating SNR².
+    # DP: best chain ending at each flat index, accumulating SNR².
     # Using SNR² so greedy selection maximizes sqrt(Σ s_i²),
     # consistent with the enrichment step.
-    chains: dict[tuple[int, int], tuple[float, list[int]]] = {}
+    chains: dict[int, tuple[float, list[int]]] = {}
 
-    for k_idx in range(K):
-        if snr[0, k_idx] > 0:
-            s = snr[0, k_idx].item()
-            chains[(0, k_idx)] = (s * s, [k_idx])
+    for idx in groups[0]:
+        idx = idx.item()
+        if snr[idx] > 0:
+            s = snr[idx].item()
+            chains[idx] = (s * s, [idx])
 
     for w in range(W - 1):
-        for kp, kn in edges[w]:
-            if (w, kp) not in chains:
+        for ip, in_ in edges[w]:
+            if ip not in chains:
                 continue
-            prev_snr_sq, prev_path = chains[(w, kp)]
-            s = snr[w + 1, kn].item()
+            prev_snr_sq, prev_path = chains[ip]
+            s = snr[in_].item()
             new_snr_sq = prev_snr_sq + s * s
-            if (w + 1, kn) not in chains or chains[(w + 1, kn)][0] < new_snr_sq:
-                chains[(w + 1, kn)] = (new_snr_sq, prev_path + [kn])
+            if in_ not in chains or chains[in_][0] < new_snr_sq:
+                chains[in_] = (new_snr_sq, prev_path + [in_])
 
     # Seed unreached tokens.
     for w in range(1, W):
-        for k_idx in range(K):
-            if snr[w, k_idx] > 0 and (w, k_idx) not in chains:
-                s = snr[w, k_idx].item()
-                chains[(w, k_idx)] = (s * s, [k_idx])
+        for idx in groups[w]:
+            idx = idx.item()
+            if snr[idx] > 0 and idx not in chains:
+                s = snr[idx].item()
+                chains[idx] = (s * s, [idx])
 
     return edges, chains
 
 
-def _greedy_assign(chains: dict, W: int) -> list[tuple[int, list[int]]]:
-    """Greedily assign non-overlapping chains by total SNR.
+def _greedy_assign(chains: dict) -> list[list[int]]:
+    """Greedily assign non-overlapping chains by total SNR².
 
-    Returns list of (w_start, path) tuples.
+    Returns list of paths (each path is a list of flat token indices).
     """
     all_chains = []
-    for (w, k_idx), (total_snr, path) in chains.items():
-        w_start = w - len(path) + 1
-        all_chains.append((total_snr, w_start, path))
+    for end_idx, (total_snr_sq, path) in chains.items():
+        all_chains.append((total_snr_sq, path))
 
     all_chains.sort(key=lambda x: x[0], reverse=True)
 
     used = set()
     result = []
-    for total_snr, w_start, path in all_chains:
-        slots = [(w_start + i, path[i]) for i in range(len(path))]
-        if any(s in used for s in slots):
+    for total_snr_sq, path in all_chains:
+        if any(idx in used for idx in path):
             continue
-        for s in slots:
-            used.add(s)
-        result.append((w_start, path))
+        for idx in path:
+            used.add(idx)
+        result.append(path)
 
     return result
 
@@ -169,20 +191,20 @@ class ChirpLinker(nn.Module):
 
         Parameters
         ----------
-        tokens : ChirpTokens with shape (B, W, K, 9)
+        tokens : ChirpTokens with shape (B, N, 9)
 
         Returns
         -------
         linked : LinkedChirpTokens
             Same 9-field data (with updated SNR/boundaries) plus
-            a separate chain_id LongTensor (B, W, K).
+            a separate chain_id LongTensor (B, N).
         """
-        B, W, K, C = tokens.shape
+        B, N, C = tokens.shape
         assert C >= N_BASE
 
         data = tokens.data[..., :N_BASE].clone()
         chain_id = torch.full(
-            (B, W, K), -1, device=tokens.device, dtype=torch.long)
+            (B, N), -1, device=tokens.device, dtype=torch.long)
 
         chain_counter = 0
         for b in range(B):
@@ -198,57 +220,55 @@ class ChirpLinker(nn.Module):
 
         Parameters
         ----------
-        tokens : (W, K, 9) float tensor, modified in-place.
-        chain_id : (W, K) long tensor, modified in-place.
+        tokens : (N, 9) float tensor, modified in-place.
+        chain_id : (N,) long tensor, modified in-place.
         chain_counter : current chain ID counter.
 
         Returns updated chain_counter.
         """
-        W, K, _ = tokens.shape
+        _, groups = _group_by_window(tokens)
+        edges, chains = _build_dag(tokens, groups, self.config)
+        assignments = _greedy_assign(chains)
 
-        edges, chains = _build_dag(tokens, self.config)
-        assignments = _greedy_assign(chains, W)
-
-        for w_start, path in assignments:
+        for path in assignments:
             V = len(path)
             if V < self.min_length:
                 continue
 
             # Assign chain ID.
-            for i in range(V):
-                chain_id[w_start + i, path[i]] = chain_counter
+            for idx in path:
+                chain_id[idx] = chain_counter
             chain_counter += 1
 
             # Accumulated SNR: sqrt(sum s_i^2).
             snr_sq_sum = 0.0
-            for i in range(V):
-                snr_sq_sum += tokens[w_start + i, path[i], 0].item() ** 2
+            for idx in path:
+                snr_sq_sum += tokens[idx, 0].item() ** 2
             snr_combined = snr_sq_sum ** 0.5
 
-            for i in range(V):
-                tokens[w_start + i, path[i], 0] = snr_combined
+            for idx in path:
+                tokens[idx, 0] = snr_combined
 
-            # Smooth boundaries between consecutive tokens.
+            # Smooth boundaries between consecutive tokens in the chain.
             for i in range(V - 1):
-                wp, kp = w_start + i, path[i]
-                wn, kn = w_start + i + 1, path[i + 1]
+                ip, in_ = path[i], path[i + 1]
 
                 # Average frequency at boundary.
-                f_avg = (tokens[wp, kp, 4] + tokens[wn, kn, 3]) / 2
-                tokens[wp, kp, 4] = f_avg
-                tokens[wn, kn, 3] = f_avg
+                f_avg = (tokens[ip, 4] + tokens[in_, 3]) / 2
+                tokens[ip, 4] = f_avg
+                tokens[in_, 3] = f_avg
 
                 # Average amplitude at boundary.
-                A_avg = (tokens[wp, kp, 6] + tokens[wn, kn, 5]) / 2
-                tokens[wp, kp, 6] = A_avg
-                tokens[wn, kn, 5] = A_avg
+                A_avg = (tokens[ip, 6] + tokens[in_, 5]) / 2
+                tokens[ip, 6] = A_avg
+                tokens[in_, 5] = A_avg
 
                 # Phase: split boundary correction evenly.
-                pe_prev = tokens[wp, kp, 8]
-                ps_next = tokens[wn, kn, 7]
+                pe_prev = tokens[ip, 8]
+                ps_next = tokens[in_, 7]
                 correction = _wrap(ps_next - pe_prev)
                 half_corr = correction / 2
-                tokens[wp, kp, 8] = pe_prev + half_corr
-                tokens[wn, kn, 7] = ps_next - half_corr
+                tokens[ip, 8] = pe_prev + half_corr
+                tokens[in_, 7] = ps_next - half_corr
 
         return chain_counter

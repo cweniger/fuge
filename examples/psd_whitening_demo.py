@@ -278,7 +278,7 @@ class chirpModel(nn.Module):
             nn.Sigmoid(),
         )
     def forward(self, x):
-        embedded, _, _ = self.token_emb(x)
+        embedded = self.token_emb(x)
         return self.head(self.backbone(embedded))
 
 

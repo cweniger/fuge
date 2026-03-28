@@ -55,19 +55,19 @@ Four classes with separated concerns. See `docs/spectral_math.md` for the full m
 
 - **`NoiseModel(nn.Module)`**: Streaming noise PSD estimator. Holds a reference to a `DechirpSTFT`, maintains EMA-updated noise std per (window, freq) bin from pure noise signals. Provides `whiten()` for SNR-based peak detection.
 
-- **`ChirpTokenizer(nn.Module)`**: Thin orchestrator composing `DechirpSTFT`, `PeakFinder`, and optionally `NoiseModel`. Returns `ChirpTokens` with 9 fields: `[snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end]`. Time in sample indices, frequency in cycles/sample (0–0.5), phases unwrapped (pe − ps = phase advance per hop). Accepts `start` parameter for dyadic multi-resolution alignment. Adjacent tokens share boundaries for voice formation.
+- **`ChirpTokenizer(nn.Module)`**: Thin orchestrator composing `DechirpSTFT`, `PeakFinder`, and optionally `NoiseModel`. Returns `ChirpTokens` with shape `(B, N, 9)` where `N = W * n_peaks`.  Fields: `[snr, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end]`. Time in sample indices, frequency in cycles/sample (0–0.5), phases unwrapped (pe − ps = phase advance per hop). Accepts `start` parameter for dyadic multi-resolution alignment. Tokens from the same window share `t_start`; adjacent windows share boundaries for voice formation.
 
 The `dlnf` parameter is per-hop; `β = 2·dlnf` is the total log-frequency change across the full window. Resampling uses linear interpolation on an exponentially warped time grid: `τ(t) = [exp(β·t) − exp(−β)] / sinh(β) − 1`. |dlnf| ≤ 0.5 supported.
 
 ### `src/fuge/spectral/tokens.py` — `ChirpTokens`, `LinkedChirpTokens`
 
-`ChirpTokens`: structured wrapper around the (B, W, K, 9) chirp token tensor with named field access (`.snr`, `.f_start`, `.phase_end`, etc.).  Supports `.cpu()`, `.to(device)`, and `ChirpTokens.cat(list)`.  The underlying tensor stays contiguous and GPU-compatible.
+`ChirpTokens`: structured wrapper around a `(B, N, 9)` chirp token tensor with named field access (`.snr`, `.f_start`, `.phase_end`, etc.).  Supports `.cpu()`, `.to(device)`, and `ChirpTokens.cat(list)`.  The underlying tensor stays contiguous and GPU-compatible.  `N = W * n_peaks` for single-resolution tokenization; tokens from the same window share the same `t_start` value.
 
-`LinkedChirpTokens(ChirpTokens)`: subclass adding a separate `(B, W, K)` long tensor for chain IDs.  Tokens in the same chain share a `chain_id >= 0`; unlinked tokens have `chain_id = -1`.  Data tensor stays at C=9.
+`LinkedChirpTokens(ChirpTokens)`: subclass adding a separate `(B, N)` long tensor for chain IDs.  Tokens in the same chain share a `chain_id >= 0`; unlinked tokens have `chain_id = -1`.  Data tensor stays at C=9.
 
 ### `src/fuge/spectral/legato.py` — `ChirpLinker(nn.Module)`
 
-Links chirp tokens across windows with boundary smoothing.  Builds a DAG of compatible tokens across adjacent windows (matching on frequency, phase, and amplitude), resolves branching via greedy highest-SNR² path selection.  For each matched chain: boundary frequencies and amplitudes are averaged to agree, boundary phases are split-corrected for coherence, SNR is replaced with accumulated chain SNR (`sqrt(Σ s_i²)`), and a chain ID is assigned.  Output is `LinkedChirpTokens` with data shape (B, W, K, 9) plus a separate chain_id tensor.
+Links chirp tokens across windows with boundary smoothing.  Builds a DAG of compatible tokens across adjacent windows (matching on frequency, phase, and amplitude), resolves branching via greedy highest-SNR² path selection.  For each matched chain: boundary frequencies and amplitudes are averaged to agree, boundary phases are split-corrected for coherence, SNR is replaced with accumulated chain SNR (`sqrt(Σ s_i²)`), and a chain ID is assigned.  Output is `LinkedChirpTokens` with data shape (B, N, 9) plus a separate chain_id tensor.  Window structure is recovered from `t_start` values.
 
 ### `src/fuge/spectral/embedding.py` — `HarmonicEmbeddingConfig`, `HarmonicEmbedding`, `HarmonicPhaseEmbeddingConfig`, `HarmonicPhaseEmbedding`, `ChirpTokenEmbedding`
 
