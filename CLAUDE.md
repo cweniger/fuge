@@ -9,6 +9,7 @@ Scientific signal embeddings toolkit, installable as the `fuge` Python package. 
 - **`src/fuge/spectral/`** — Spectral analysis subpackage: STFT with de-chirping, chirp tokenization, and chirp token embedding
 - **`src/fuge/svd/`** — Streaming PCA with Procrustes-stabilized output (StreamingPCA)
 - **`src/fuge/nn.py`** — Generic neural network building blocks (TransformerEmbedding)
+- **`src/fuge/chirp.py`** — JAX-based test-signal generator (chirp waveforms for demos and training)
 - **`docs/spectral_math.md`** — Mathematical reference for the chirp tokenization pipeline
 
 ## Installation
@@ -20,20 +21,25 @@ pip install -e .
 ## Running
 
 ```bash
-# Run spectral decomposition demo (generates spectral_demo.png, peaks_demo.png)
-python examples/spectral_demo.py
+# Reconstruction / exploration demos (destined to become notebooks):
+python notebooks/spectral_demo.py
+python notebooks/voice_demo.py
+python notebooks/merger_reconstruction_demo.py
+python notebooks/multiresolution_demo.py
 
-# Run chirp signal generator demo (generates chirp_demo.png)
-python examples/chirp_demo.py
-
-# Run voice stitching demo (generates voice_demo.png)
-python examples/voice_demo.py
-
-# Run streaming PCA demo (generates svd_demo_procrustes.png, svd_demo_wiener.png)
+# ML pipeline reference implementations:
+python examples/fisher_demo.py
+python examples/transformer_demo.py
+python examples/psd_whitening_demo.py
 python examples/svd_demo.py
 ```
 
-There is no formal test suite. Demo scripts live in `examples/`. No build system, linting, or CI is configured beyond `pyproject.toml`.
+Top-level folders:
+- `notebooks/` — exploratory demos (currently `.py`, to be converted to `.ipynb`)
+- `examples/` — reference implementations of the ML pipeline
+- `scripts/` — systematic-tuning / optimization scripts with structured stdout (empty, to be populated)
+
+No formal test suite yet, no linting, no CI beyond `pyproject.toml`.
 
 ## Architecture
 
@@ -100,6 +106,7 @@ fuge/
 │   └── fuge/
 │       ├── __init__.py              # package docstring, no flat re-exports
 │       ├── nn.py                    # TransformerEmbedding (generic)
+│       ├── chirp.py                 # JAX test-signal generator
 │       ├── spectral/
 │       │   ├── __init__.py          # re-exports all public classes
 │       │   ├── tokens.py            # ChirpTokens
@@ -109,15 +116,21 @@ fuge/
 │       └── svd/
 │           ├── __init__.py          # re-exports: StreamingPCA
 │           └── core.py              # StreamingPCA
-└── examples/
-    ├── chirp.py                     # test signal generator (JAX)
-    ├── chirp_demo.py
-    ├── spectral_demo.py
-    ├── transformer_demo.py
-    ├── psd_whitening_demo.py
-    ├── fisher_demo.py
-    ├── voice_demo.py
-    └── svd_demo.py
+├── notebooks/                       # exploratory demos (to become .ipynb)
+│   ├── chirp_demo.py
+│   ├── spectral_demo.py
+│   ├── token_continuity_demo.py
+│   ├── token_reconstruction_demo.py
+│   ├── merger_reconstruction_demo.py
+│   ├── multiresolution_demo.py
+│   ├── voice_demo.py
+│   └── emri_demo.py
+├── examples/                        # ML pipeline reference implementations
+│   ├── fisher_demo.py
+│   ├── transformer_demo.py
+│   ├── psd_whitening_demo.py
+│   └── svd_demo.py
+└── scripts/                         # optimization / tuning scripts (empty)
 ```
 
 ## Dependencies

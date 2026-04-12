@@ -15,7 +15,7 @@ jax.config.update("jax_enable_x64", True)
 from fuge.spectral import (ChirpTokenizer, ChirpTokens, ChirpTokenEmbedding,
                            HarmonicEmbeddingConfig, HarmonicPhaseEmbeddingConfig)
 from fuge.nn import TransformerEmbedding
-from chirp import chirp_signal
+from fuge.chirp import chirp_signal
 
 # ── Signal parameters ────────────────────────────────────────────────
 N = 100_000

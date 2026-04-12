@@ -16,7 +16,6 @@ The greedy algorithm:
      (better frequency resolution).
 """
 
-import sys
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -25,7 +24,6 @@ import matplotlib.patches as mpatches
 import jax
 jax.config.update("jax_enable_x64", True)
 
-sys.path.insert(0, ".")
 from fuge.spectral import ChirpTokenizer
 
 # ── Signal parameters ────────────────────────────────────────────────

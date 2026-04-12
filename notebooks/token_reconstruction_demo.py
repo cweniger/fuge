@@ -12,7 +12,6 @@ Reconstruction per window per peak:
   4. Apply Hann window, overlap-add.
 """
 
-import sys
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -20,8 +19,7 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-sys.path.insert(0, ".")
-from chirp import chirp_signal
+from fuge.chirp import chirp_signal
 from fuge.spectral import ChirpTokenizer
 
 # ── Signal parameters ────────────────────────────────────────────────
