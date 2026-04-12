@@ -10,7 +10,6 @@ For a clean (noiseless) signal these should match closely.  The plots
 show both the raw values over time and the boundary mismatch histograms.
 """
 
-import sys
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -18,8 +17,7 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-sys.path.insert(0, ".")
-from chirp import chirp_signal
+from fuge.chirp import chirp_signal
 from fuge.spectral import ChirpTokenizer
 
 # ── Signal parameters ────────────────────────────────────────────────

@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from scipy.signal import spectrogram
 
-from chirp import chirp_signal, _chirp_impl
+from fuge.chirp import chirp_signal, _chirp_impl
 
 if __name__ == "__main__":
     params = dict(

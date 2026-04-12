@@ -5,7 +5,6 @@ power-law amplitude rise, followed by exponential ringdown), tokenizes
 it, reconstructs from tokens, and compares with the original.
 """
 
-import sys
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -13,7 +12,6 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-sys.path.insert(0, ".")
 from fuge.spectral import ChirpTokenizer
 
 # ── Signal parameters ────────────────────────────────────────────────
