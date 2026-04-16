@@ -12,7 +12,6 @@ Reconstruction per window per peak:
   4. Apply Hann window, overlap-add.
 """
 
-import sys
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -20,8 +19,7 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-sys.path.insert(0, ".")
-from chirp import chirp_signal
+from fuge.chirp import chirp_signal
 from fuge.spectral import ChirpTokenizer
 
 # ── Signal parameters ────────────────────────────────────────────────
@@ -62,7 +60,6 @@ def reconstruct_from_tokens(tokens, k, N_signal):
     signal : ndarray, shape (N_signal,)
     """
     hop = k // 2
-    W, K, _ = tokens.shape
     Fk = k // 2 + 1
 
     # Sample indices within a window
@@ -76,27 +73,31 @@ def reconstruct_from_tokens(tokens, k, N_signal):
     signal = np.zeros(N_signal)
     norm = np.zeros(N_signal)
 
-    for w in range(W):
-        start = w * hop
+    # Group tokens by window using t_start
+    unique_t = np.unique(tokens[:, 1])
+
+    for t_s in unique_t:
+        start = int(t_s - k / 4)
         end = start + k
         if end > N_signal:
             break
 
         window_signal = np.zeros(k)
+        mask = tokens[:, 1] == t_s
 
-        for p in range(K):
-            snr = tokens[w, p, 0]
+        for tok in tokens[mask]:
+            snr = tok[0]
             if snr <= 0:
                 continue
 
             # Denormalize frequencies from [-1, 1] to bin indices
-            f_start_bin = (tokens[w, p, 3] + 1.0) / 2.0 * (Fk - 1)
-            f_end_bin = (tokens[w, p, 4] + 1.0) / 2.0 * (Fk - 1)
+            f_start_bin = (tok[3] + 1.0) / 2.0 * (Fk - 1)
+            f_end_bin = (tok[4] + 1.0) / 2.0 * (Fk - 1)
 
-            A_s = tokens[w, p, 5]
-            A_e = tokens[w, p, 6]
-            ps = tokens[w, p, 7]
-            pe = tokens[w, p, 8]
+            A_s = tok[5]
+            A_e = tok[6]
+            ps = tok[7]
+            pe = tok[8]
 
             # Linearly interpolate amplitude
             A_n = A_s + (A_e - A_s) * frac  # (k,)
@@ -155,10 +156,9 @@ def main():
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double()
 
-    tokens = tokenizer(x)  # (1, W, K, 9)
-    tokens = tokens[0].numpy()  # (W, K, 9)
-    W, K, _ = tokens.shape
-    print(f"  {W} windows, {K} peaks/window")
+    tokens = tokenizer(x)  # (1, N, 9)
+    tokens = tokens.data[0].numpy()  # (N, 9)
+    print(f"  {tokens.shape[0]} tokens")
 
     # Reconstruct
     print("Reconstructing from tokens...")

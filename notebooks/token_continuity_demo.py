@@ -10,7 +10,6 @@ For a clean (noiseless) signal these should match closely.  The plots
 show both the raw values over time and the boundary mismatch histograms.
 """
 
-import sys
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -18,8 +17,7 @@ import matplotlib.pyplot as plt
 import jax
 jax.config.update("jax_enable_x64", True)
 
-sys.path.insert(0, ".")
-from chirp import chirp_signal
+from fuge.chirp import chirp_signal
 from fuge.spectral import ChirpTokenizer
 
 # ── Signal parameters ────────────────────────────────────────────────
@@ -61,10 +59,10 @@ def main():
         dlnf_min=DLNF_MIN, dlnf_max=DLNF_MAX,
     ).double()
 
-    tokens = tokenizer(x)  # (1, W, K, 9)
-    tokens = tokens[0, :, 0, :]  # (W, 9) — first (only) peak
+    tokens = tokenizer(x)  # (1, N, 9) where N = W * N_PEAKS
+    tokens = tokens.data[0]  # (N, 9) — with N_PEAKS=1, one token per window
     W = tokens.shape[0]
-    print(f"  {W} windows, token shape per peak: {tokens.shape}")
+    print(f"  {W} tokens")
 
     # Extract fields: [snr, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe]
     snr = tokens[:, 0].numpy()
