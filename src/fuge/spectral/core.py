@@ -624,7 +624,7 @@ class ChirpTokenizer(nn.Module):
 
     Output
     ------
-    forward(x) returns chirp tokens of shape (B, W, K, 9):
+    forward(x) returns ChirpTokens of shape (B, N, 9) where N = W * n_peaks:
     [snr, t_start, t_end, f_start, f_end, A_start, A_end,
      phase_start, phase_end].
     t_start/t_end: absolute sample indices in the input signal.
