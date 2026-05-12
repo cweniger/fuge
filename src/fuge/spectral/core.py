@@ -20,6 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from fuge.spectral.tokens import ChirpTokens
+
 
 def _make_t_grid(k: int, dtype=torch.float32) -> torch.Tensor:
     """Discrete sample grid: t_n = 2n/k - 1 for n = 0, …, k-1."""
@@ -622,7 +624,7 @@ class ChirpTokenizer(nn.Module):
 
     Output
     ------
-    forward(x) returns chirp tokens of shape (B, W, K, 9):
+    forward(x) returns ChirpTokens of shape (B, N, 9) where N = W * n_peaks:
     [snr, t_start, t_end, f_start, f_end, A_start, A_end,
      phase_start, phase_end].
     t_start/t_end: absolute sample indices in the input signal.
@@ -660,14 +662,14 @@ class ChirpTokenizer(nn.Module):
         return 9
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> ChirpTokens:
         """Tokenize batched time-domain signals into chirp tokens.
 
         Returns
         -------
-        tokens : Tensor, shape (B, W, K, 9)
-            [snr, t_start, t_end, f_start, f_end, A_start, A_end,
-             phase_start, phase_end].
+        tokens : ChirpTokens, shape (B, N, 9) where N = W * n_peaks
+            Fields: snr, t_start, t_end, f_start, f_end, A_start, A_end,
+            phase_start, phase_end.
             t: sample indices.  f: cycles/sample (0–0.5).
             ps, pe: unwrapped.  pe - ps = phase advance per hop.
         """
@@ -712,7 +714,8 @@ class ChirpTokenizer(nn.Module):
         # pe - ps is the exact phase advance across one hop
         # (no modular ambiguity, ≈ 2π · f_center · hop for non-chirped).
 
-        tokens = torch.stack(
+        # Stack fields: (B, W, K, 9), then flatten W*K -> N.
+        data = torch.stack(
             [snr, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe], dim=-1)
-
-        return tokens
+        B = data.shape[0]
+        return ChirpTokens(data.reshape(B, -1, 9))

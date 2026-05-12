@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
 
-from chirp import _chirp_impl
+from fuge.chirp import _chirp_impl
 
 # ── Signal parameters (matching transformer_demo.py) ────────────────
 T_C = 1e6
