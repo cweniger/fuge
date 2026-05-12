@@ -66,9 +66,9 @@ class ChirpTokens:
         return type(self)(self.data.to(*args, **kwargs))
 
     @classmethod
-    def cat(cls, token_list, dim=0):
-        """Concatenate a list of ChirpTokens along the given dimension."""
-        return cls(torch.cat([t.data for t in token_list], dim=dim))
+    def cat(cls, token_list):
+        """Concatenate tokens across resolutions: (B, N1+N2+..., 9)."""
+        return cls(torch.cat([t.data for t in token_list], dim=1))
 
     @property
     def snr(self) -> torch.Tensor:
@@ -142,10 +142,10 @@ class LinkedChirpTokens(ChirpTokens):
         )
 
     @classmethod
-    def cat(cls, token_list, dim=0):
+    def cat(cls, token_list):
         return cls(
-            torch.cat([t.data for t in token_list], dim=dim),
-            torch.cat([t._chain_id for t in token_list], dim=dim),
+            torch.cat([t.data for t in token_list], dim=1),
+            torch.cat([t._chain_id for t in token_list], dim=1),
         )
 
     @property
