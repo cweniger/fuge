@@ -3,7 +3,7 @@
 Transforms raw chirp token features via harmonic embeddings — multi-scale
 sin/cos representations that give the network sensitivity at all relevant
 scales.  Four parameter types (time, frequency, amplitude, phase), each
-embedded at both boundaries (_start, _end), plus log1p(SNR) as a scalar.
+embedded at both boundaries (_start, _end), plus log1p(score) as a scalar.
 
 Two embedding types:
   HarmonicEmbedding: for bounded scalar parameters (time, frequency,
@@ -14,7 +14,8 @@ Two embedding types:
       phase comparison) and up (for fine wrapped-phase matching).
 
 Input token format (from ChirpTokenizer):
-  snr: peak amplitude / noise std (log1p scalar, not harmonically embedded)
+  score: amplitude / noise_std (SNR) when calibrated, raw amplitude otherwise
+         (log1p scalar, not harmonically embedded)
   t_start, t_end: absolute sample indices
   f_start, f_end: frequency in cycles/sample (0 to 0.5)
   A_start, A_end: boundary amplitudes
@@ -210,7 +211,7 @@ class ChirpTokenEmbedding(nn.Module):
 
     Three bounded-scalar parameter types (time, freq, amp) each get a
     HarmonicEmbedding at both boundaries.  Phase gets a
-    HarmonicPhaseEmbedding at both boundaries.  Plus log1p(SNR) as a
+    HarmonicPhaseEmbedding at both boundaries.  Plus log1p(score) as a
     scalar.  Total: 6 harmonic + 2 phase embeddings + 1 scalar.
 
     Parameters
@@ -237,7 +238,7 @@ class ChirpTokenEmbedding(nn.Module):
             + freq.n_embed * 2   # f_start, f_end
             + amp.n_embed * 2    # A_start, A_end
             + phase.n_embed * 2  # phase_start, phase_end
-            + 1                  # log1p(snr)
+            + 1                  # log1p(score)
         )
 
     def forward(self, raw_tokens):
@@ -253,7 +254,7 @@ class ChirpTokenEmbedding(nn.Module):
         """
         raw_tokens = _to_tensor(raw_tokens)
 
-        snr = torch.log1p(raw_tokens[..., 0:1])
+        score = torch.log1p(raw_tokens[..., 0:1])
 
         t_s = self.embed_time(raw_tokens[..., 1])
         t_e = self.embed_time(raw_tokens[..., 2])
@@ -268,6 +269,6 @@ class ChirpTokenEmbedding(nn.Module):
         ph_e = self.embed_phase(raw_tokens[..., 8])
 
         return torch.cat(
-            [snr, t_s, t_e, f_s, f_e, a_s, a_e, ph_s, ph_e],
+            [score, t_s, t_e, f_s, f_e, a_s, a_e, ph_s, ph_e],
             dim=-1,
         )

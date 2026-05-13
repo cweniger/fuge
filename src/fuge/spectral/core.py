@@ -542,20 +542,25 @@ class PeakFinder(nn.Module):
 class NoiseModel(nn.Module):
     """Streaming noise PSD estimator for whitening STFT output.
 
-    Holds a reference to a DechirpSTFT and maintains a running estimate
-    of the noise standard deviation per (window, frequency) bin.
+    Maintains a running per-(window, frequency-bin) noise standard deviation,
+    estimated from pure-noise time series passed to update().  Uses dlnf=0
+    (no de-chirping) — noise is broadband and doesn't chirp, so de-chirping
+    is unnecessary for estimation.
 
     Parameters
     ----------
-    stft : DechirpSTFT
-        The STFT instance used for signal analysis (same window, same k).
+    k : int
+        Window size in samples (must match the tokenizer).
+    start : int
+        Sample index of the first window (must match the tokenizer).
     momentum : float
         EMA smoothing factor for noise std updates (default 0.99).
     """
 
-    def __init__(self, stft: DechirpSTFT, momentum: float = 0.99):
+    def __init__(self, k: int, start: int, momentum: float = 0.99):
         super().__init__()
-        self.stft = stft
+        self._stft = DechirpSTFT(k=k)
+        self.start = start
         self.momentum = momentum
         self.register_buffer("noise_std", None)
 
@@ -567,9 +572,8 @@ class NoiseModel(nn.Module):
         ----------
         x : Tensor, shape (B, N)
         """
-        X = self.stft(x)[:, :, 0, :]    # (B, W, D=1, Fk) -> (B, W, Fk)
-        std_new = X.abs().std(dim=0)     # (W, Fk)
-
+        X = self._stft(x, dlnf=0., start=self.start)[:, :, 0, :]  # (B, W, Fk)
+        std_new = X.abs().std(dim=0)                                 # (W, Fk)
         if self.noise_std is None:
             self.noise_std = std_new
         else:
@@ -593,9 +597,8 @@ class NoiseModel(nn.Module):
 class ChirpTokenizer(nn.Module):
     """Tokenize time-domain signals into chirp tokens.
 
-    Orchestrates DechirpSTFT, PeakFinder, and (optionally) NoiseModel
-    into a single forward pass: STFT → whitening → peak finding →
-    normalization → chirp token output.
+    Orchestrates DechirpSTFT, PeakFinder, and NoiseModel into a single
+    forward pass: STFT → whitening → peak finding → chirp token output.
 
     Chirp tokens are the building blocks for voice formation: adjacent
     tokens with compatible boundary values (f_end[w] ≈ f_start[w+1],
@@ -614,8 +617,8 @@ class ChirpTokenizer(nn.Module):
         Number of dlnf (relative chirp rate) grid points.
     dlnf_min, dlnf_max : float
         Range of dlnf grid.  |dlnf| ≤ 0.5 recommended.
-    noise_model : NoiseModel or None
-        Pre-configured noise model for whitening.
+    momentum : float
+        EMA smoothing factor for the internal noise model (default 0.99).
     start : int or None
         Sample index where the first window begins.  Default None
         uses k//4 for dyadic multi-resolution alignment (token
@@ -624,9 +627,12 @@ class ChirpTokenizer(nn.Module):
 
     Output
     ------
-    forward(x) returns ChirpTokens of shape (B, N, 9) where N = W * n_peaks:
-    [snr, t_start, t_end, f_start, f_end, A_start, A_end,
+    forward(x, noise=None) returns ChirpTokens of shape (B, N, 9)
+    where N = W * n_peaks:
+    [score, t_start, t_end, f_start, f_end, A_start, A_end,
      phase_start, phase_end].
+    score: amplitude / noise_std (SNR) if noise has been supplied,
+        raw amplitude otherwise.
     t_start/t_end: absolute sample indices in the input signal.
     f_start/f_end: frequency in cycles per sample (0 to 0.5) at
         token boundaries.  Multiply by f_sample to get Hz.
@@ -640,15 +646,15 @@ class ChirpTokenizer(nn.Module):
     def __init__(self, k: int = 1024, n_peaks: int = 3,
                  radius: int = 2, n_dlnf: int = 11,
                  dlnf_min: float = 0.0, dlnf_max: float = 0.05,
-                 noise_model: 'NoiseModel | None' = None,
+                 momentum: float = 0.99,
                  start: int = None):
         super().__init__()
         self.stft = DechirpSTFT(k=k)
         self.peak_finder = PeakFinder(stft=self.stft)
-        self.noise_model = noise_model
         self.n_peaks = n_peaks
         self.radius = radius
         self.start = k // 4 if start is None else start
+        self.noise_model = NoiseModel(k=k, start=self.start, momentum=momentum)
         self.register_buffer(
             "dlnf_grid", torch.linspace(dlnf_min, dlnf_max, n_dlnf))
 
@@ -662,30 +668,43 @@ class ChirpTokenizer(nn.Module):
         return 9
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> ChirpTokens:
+    def forward(self, x: torch.Tensor,
+                noise: torch.Tensor | None = None) -> ChirpTokens:
         """Tokenize batched time-domain signals into chirp tokens.
+
+        Parameters
+        ----------
+        x : Tensor, shape (B, N)
+        noise : Tensor, shape (B, N) or None
+            Pure-noise time series used to update the internal noise model
+            before tokenizing.  When provided, the noise_model is updated
+            via EMA and STFT bins are whitened so token.score ≈ SNR.
+            When None and noise_model has no estimate yet, score = raw amplitude.
 
         Returns
         -------
         tokens : ChirpTokens, shape (B, N, 9) where N = W * n_peaks
-            Fields: snr, t_start, t_end, f_start, f_end, A_start, A_end,
+            Fields: score, t_start, t_end, f_start, f_end, A_start, A_end,
             phase_start, phase_end.
             t: sample indices.  f: cycles/sample (0–0.5).
             ps, pe: unwrapped.  pe - ps = phase advance per hop.
         """
         B, N = x.shape
 
+        if noise is not None:
+            self.noise_model.update(noise)
+
         start = self.start
         X_start, X_end = self.stft(
             x, dlnf=self.dlnf_grid, n_hann_splits=2, start=start)
         X = X_start + X_end
 
-        if self.noise_model is not None:
+        if self.noise_model.noise_std is not None:
             X_w = self.noise_model.whiten(X)
         else:
             X_w = X
 
-        peaks, freq, dlnf, snr = self.peak_finder.find_peaks(
+        peaks, freq, dlnf, score = self.peak_finder.find_peaks(
             X_w, K=self.n_peaks, dlnf_grid=self.dlnf_grid, radius=self.radius)
         ps, pe = self.peak_finder.peak_phases(
             X_w, peaks, freq, dlnf, self.dlnf_grid)
@@ -716,6 +735,6 @@ class ChirpTokenizer(nn.Module):
 
         # Stack fields: (B, W, K, 9), then flatten W*K -> N.
         data = torch.stack(
-            [snr, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe], dim=-1)
+            [score, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe], dim=-1)
         B = data.shape[0]
         return ChirpTokens(data.reshape(B, -1, 9))
