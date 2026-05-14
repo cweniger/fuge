@@ -49,9 +49,9 @@ No formal test suite yet, no linting, no CI beyond `pyproject.toml`.
 
 **Terminology:** The tokenizer extracts **chirp tokens** — short spectral components with frequency, amplitude, and phase at window boundaries. Phase-coherent sequences of chirp tokens stitched across windows form **voices**. The full set of voices in a signal is the **choir**. (The package name `fuge` alludes to the musical fugue.)
 
-### `src/fuge/spectral/core.py` — `DechirpSTFT`, `PeakFinder`, `NoiseModel`, `ChirpTokenizer`
+### `src/fuge/spectral/core.py` — `DechirpSTFT`, `PeakFinder`, `NoiseModel`, `ChirpTokenizer`, `DyadicChirpTokenizer`
 
-Four classes with separated concerns. See `docs/spectral_math.md` for the full mathematical reference.
+Five classes with separated concerns. See `docs/spectral_math.md` for the full mathematical reference.
 
 **Coordinate convention:** `t ∈ [-1, 1]` across each window, with `n(t) = k/2 · (t + 1)`. Discrete samples at `t_n = 2n/k - 1`. Token boundaries at `t = ±½` (samples k/4 and 3k/4). Periodic Hann window with zero at n=0, peak at n=k/2. Requires `k % 4 == 0`.
 
@@ -62,6 +62,8 @@ Four classes with separated concerns. See `docs/spectral_math.md` for the full m
 - **`NoiseModel(nn.Module)`**: Streaming noise PSD estimator. Takes `k` and `start` (same as tokenizer), maintains EMA-updated noise std per (window, freq) bin from pure-noise signals passed to `update()`. Uses `dlnf=0` for estimation (noise doesn't chirp). Instantiated internally by `ChirpTokenizer`.
 
 - **`ChirpTokenizer(nn.Module)`**: Orchestrator composing `DechirpSTFT`, `PeakFinder`, and `NoiseModel`. Returns `ChirpTokens` with shape `(B, N, 9)` where `N = W * n_peaks`.  Fields: `[score, t_start, t_end, f_start, f_end, A_start, A_end, phase_start, phase_end]`. `score` is amplitude/noise_std (SNR) when noise has been supplied, raw amplitude otherwise. `forward(x, noise=None)`: passing a pure-noise batch updates the internal noise model before tokenizing. Time in sample indices, frequency in cycles/sample (0–0.5), phases unwrapped (pe − ps = phase advance per hop). Accepts `start` parameter for dyadic multi-resolution alignment.
+
+- **`DyadicChirpTokenizer(nn.Module)`**: Multi-resolution wrapper running one `ChirpTokenizer` per dyadic scale (`k_min, 2·k_min, …, k_max`). Merges tokens from all scales and returns them sorted by score descending. `k_min` must be divisible by 4; `k_max/k_min` must be a power of 2. `dlnf_max` is scaled proportionally with k (same physical chirp rate → proportionally larger dlnf at larger hop), clamped at 0.5. Each scale maintains its own `NoiseModel`; passing `noise=` to `forward` updates all of them. Output shape `(B, N_total, 9)` where `N_total = Σ_k W_k · n_peaks`.
 
 The `dlnf` parameter is per-hop; `β = 2·dlnf` is the total log-frequency change across the full window. Resampling uses linear interpolation on an exponentially warped time grid: `τ(t) = [exp(β·t) − exp(−β)] / sinh(β) − 1`. |dlnf| ≤ 0.5 supported.
 
@@ -110,7 +112,7 @@ fuge/
 │       ├── spectral/
 │       │   ├── __init__.py          # re-exports all public classes
 │       │   ├── tokens.py            # ChirpTokens
-│       │   ├── core.py              # DechirpSTFT, PeakFinder, NoiseModel, ChirpTokenizer
+│       │   ├── core.py              # DechirpSTFT, PeakFinder, NoiseModel, ChirpTokenizer, DyadicChirpTokenizer
 │       │   ├── legato.py            # ChirpLinker, ChirpLinkConfig
 │       │   └── embedding.py         # ChirpTokenEmbedding
 │       └── svd/

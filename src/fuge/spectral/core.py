@@ -2,10 +2,11 @@
 
 Classes
 -------
-DechirpSTFT      — STFT with half-overlapping Hann windows and resample de-chirping.
-PeakFinder       — Find and characterize spectral peaks (frequency, phase, amplitude).
-NoiseModel       — Streaming noise PSD estimator for whitening.
-ChirpTokenizer   — Orchestrates STFT → whitening → peak finding → token output.
+DechirpSTFT           — STFT with half-overlapping Hann windows and resample de-chirping.
+PeakFinder            — Find and characterize spectral peaks (frequency, phase, amplitude).
+NoiseModel            — Streaming noise PSD estimator for whitening.
+ChirpTokenizer        — Orchestrates STFT → whitening → peak finding → token output.
+DyadicChirpTokenizer  — Multi-resolution tokenizer: dyadic k grid, tokens merged by score.
 
 Coordinate convention (see docs/spectral_math.md):
     t ∈ [-1, 1] across the window, n(t) = k/2 · (t + 1).
@@ -15,6 +16,7 @@ Coordinate convention (see docs/spectral_math.md):
     β = 2·dlnf (total log-frequency change across the full window).
 """
 
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -573,11 +575,13 @@ class NoiseModel(nn.Module):
         x : Tensor, shape (B, N)
         """
         X = self._stft(x, dlnf=0., start=self.start)[:, :, 0, :]  # (B, W, Fk)
-        std_new = X.abs().mean(dim=0)                                # (W, Fk) mean amplitude
+        per_window = X.abs().mean(dim=0)                             # (W, Fk)
         if self.noise_std is None:
-            self.noise_std = std_new
+            # Stable initialization: global B×W average broadcast to (W, Fk).
+            global_floor = per_window.mean(dim=0, keepdim=True)     # (1, Fk)
+            self.noise_std = global_floor.expand_as(per_window).clone()
         else:
-            self.noise_std = self.momentum * self.noise_std + (1 - self.momentum) * std_new
+            self.noise_std = self.momentum * self.noise_std + (1 - self.momentum) * per_window
 
     def whiten(self, X: torch.Tensor) -> torch.Tensor:
         """Divide STFT bins by noise std.
@@ -738,3 +742,84 @@ class ChirpTokenizer(nn.Module):
             [score, t_start, t_end, f_start, f_end, A_start, A_end, ps, pe], dim=-1)
         B = data.shape[0]
         return ChirpTokens(data.reshape(B, -1, 9))
+
+
+class DyadicChirpTokenizer(nn.Module):
+    """Multi-resolution chirp tokenizer over a dyadic window-size grid.
+
+    Runs one ChirpTokenizer per scale (k_min, 2·k_min, …, k_max), merges
+    all tokens, and returns them sorted by score descending.  Tokens from
+    all scales share the same 9-field format and their scores are directly
+    comparable (both are amplitude / noise_std when the noise model is
+    active).
+
+    dlnf_max is scaled proportionally to k at each scale (same physical
+    chirp rate maps to proportionally larger dlnf for larger hop size),
+    clamped at 0.5 (the de-chirping limit).
+
+    Parameters
+    ----------
+    k_min : int
+        Smallest window size.  Must be divisible by 4.
+    k_max : int
+        Largest window size.  k_max / k_min must be a power of 2.
+    n_peaks : int
+        Peaks per time window per scale (default 3).
+    n_dlnf : int
+        Number of dlnf grid points per scale (default 11).
+    dlnf_max : float
+        Max dlnf at k_min.  Scaled linearly with k at larger scales,
+        clamped at 0.5.  Default 0.3.
+    momentum : float
+        EMA momentum for each scale's noise model (default 0.99).
+    """
+
+    def __init__(self, k_min: int = 256, k_max: int = 1024,
+                 n_peaks: int = 3, n_dlnf: int = 11,
+                 dlnf_max: float = 0.3, momentum: float = 0.99):
+        super().__init__()
+        assert k_min % 4 == 0, f"k_min must be divisible by 4, got {k_min}"
+        assert k_max >= k_min, f"k_max must be >= k_min"
+        n_oct = math.log2(k_max / k_min)
+        assert abs(n_oct - round(n_oct)) < 1e-9, \
+            f"k_max / k_min must be a power of 2, got {k_max / k_min}"
+
+        k_values = [k_min * (2 ** i) for i in range(int(round(n_oct)) + 1)]
+        self.tokenizers = nn.ModuleList([
+            ChirpTokenizer(
+                k=k,
+                n_peaks=n_peaks,
+                n_dlnf=n_dlnf,
+                dlnf_max=min(dlnf_max * k / k_min, 0.5),
+                momentum=momentum,
+            )
+            for k in k_values
+        ])
+        self.k_min = k_min
+        self.k_max = k_max
+        self.k_values = k_values
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor,
+                noise: torch.Tensor | None = None) -> ChirpTokens:
+        """Tokenize at all scales and return tokens sorted by score descending.
+
+        Parameters
+        ----------
+        x : Tensor, shape (B, N)
+        noise : Tensor, shape (B, N) or None
+            Pure-noise time series; updates the noise model at every scale.
+
+        Returns
+        -------
+        tokens : ChirpTokens, shape (B, N_total, 9)
+            All tokens from all scales, score-sorted (descending).
+            N_total = Σ_k  W_k · n_peaks  (deterministic for fixed-length x).
+        """
+        parts = [tok(x, noise=noise).data for tok in self.tokenizers]
+        combined = torch.cat(parts, dim=1)  # (B, N_total, 9)
+
+        order = combined[..., 0].argsort(dim=1, descending=True)
+        combined = combined.gather(1, order.unsqueeze(-1).expand_as(combined))
+
+        return ChirpTokens(combined)
