@@ -651,7 +651,8 @@ class ChirpTokenizer(nn.Module):
                  radius: int = 2, n_dlnf: int = 11,
                  dlnf_min: float = 0.0, dlnf_max: float = 0.05,
                  momentum: float = 0.99,
-                 start: int = None):
+                 start: int = None,
+                 f_min: float | None = None, f_max: float | None = None):
         super().__init__()
         self.stft = DechirpSTFT(k=k)
         self.peak_finder = PeakFinder(stft=self.stft)
@@ -661,6 +662,8 @@ class ChirpTokenizer(nn.Module):
         self.noise_model = NoiseModel(k=k, start=self.start, momentum=momentum)
         self.register_buffer(
             "dlnf_grid", torch.linspace(dlnf_min, dlnf_max, n_dlnf))
+        self.f_min = f_min
+        self.f_max = f_max
 
     @property
     def k(self):
@@ -706,7 +709,16 @@ class ChirpTokenizer(nn.Module):
         if self.noise_model.noise_std is not None:
             X_w = self.noise_model.whiten(X)
         else:
-            X_w = X
+            X_w = X.clone()
+
+        if self.f_min is not None or self.f_max is not None:
+            k = self.stft.k
+            if self.f_min is not None:
+                X_w[:, :, :, :math.ceil(self.f_min * k)] = 0
+            if self.f_max is not None:
+                f_max_bin = math.floor(self.f_max * k)
+                if f_max_bin + 1 < self.stft.Fk:
+                    X_w[:, :, :, f_max_bin + 1:] = 0
 
         peaks, freq, dlnf, score = self.peak_finder.find_peaks(
             X_w, K=self.n_peaks, dlnf_grid=self.dlnf_grid, radius=self.radius)
@@ -801,6 +813,8 @@ class DyadicChirpTokenizer(nn.Module):
                 n_dlnf=n_dlnf,
                 dlnf_max=min(dlnf_max * k / k_min, 0.5),
                 momentum=momentum,
+                f_min=f_min,
+                f_max=f_max,
             )
             for k in k_values
         ])
@@ -831,15 +845,6 @@ class DyadicChirpTokenizer(nn.Module):
         """
         parts = [tok(x, noise=noise).data for tok in self.tokenizers]
         combined = torch.cat(parts, dim=1)  # (B, N_total, 9)
-
-        if self.f_min is not None or self.f_max is not None:
-            f_centre = (combined[..., 3] + combined[..., 4]) / 2  # (B, N_total)
-            mask = torch.ones_like(f_centre, dtype=torch.bool)
-            if self.f_min is not None:
-                mask &= f_centre >= self.f_min
-            if self.f_max is not None:
-                mask &= f_centre <= self.f_max
-            combined[..., 0] = combined[..., 0] * mask  # zero score of out-of-band tokens
 
         order = combined[..., 0].argsort(dim=1, descending=True)
         combined = combined.gather(1, order.unsqueeze(-1).expand_as(combined))
