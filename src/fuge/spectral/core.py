@@ -801,7 +801,8 @@ class DyadicChirpTokenizer(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor,
-                noise: torch.Tensor | None = None) -> ChirpTokens:
+                noise: torch.Tensor | None = None,
+                n_tokens: int | None = None) -> ChirpTokens:
         """Tokenize at all scales and return tokens sorted by score descending.
 
         Parameters
@@ -809,10 +810,15 @@ class DyadicChirpTokenizer(nn.Module):
         x : Tensor, shape (B, N)
         noise : Tensor, shape (B, N) or None
             Pure-noise time series; updates the noise model at every scale.
+        n_tokens : int or None
+            If set, truncate or pad the output to exactly this many tokens
+            per batch element (fixed output shape, suitable for batched ML).
+            Tokens beyond the top n_tokens are zero-padded (score=0).
+            If None, return all tokens from all scales.
 
         Returns
         -------
-        tokens : ChirpTokens, shape (B, N_total, 9)
+        tokens : ChirpTokens, shape (B, n_tokens, 9) or (B, N_total, 9)
             All tokens from all scales, score-sorted (descending).
             N_total = Σ_k  W_k · n_peaks  (deterministic for fixed-length x).
         """
@@ -821,5 +827,13 @@ class DyadicChirpTokenizer(nn.Module):
 
         order = combined[..., 0].argsort(dim=1, descending=True)
         combined = combined.gather(1, order.unsqueeze(-1).expand_as(combined))
+
+        if n_tokens is not None:
+            N_total = combined.shape[1]
+            if n_tokens <= N_total:
+                combined = combined[:, :n_tokens]
+            else:
+                pad = combined.new_zeros(combined.shape[0], n_tokens - N_total, 9)
+                combined = torch.cat([combined, pad], dim=1)
 
         return ChirpTokens(combined)
