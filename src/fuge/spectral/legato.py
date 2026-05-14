@@ -4,7 +4,7 @@ Finds matching tokens in adjacent windows (by frequency, phase, and
 amplitude continuity), links them into chains, and enriches the tokens:
 - Boundary frequencies and amplitudes are averaged to agree.
 - Boundary phases are split-corrected for coherence.
-- SNR is replaced with accumulated chain SNR: sqrt(sum s_i^2).
+- score is replaced with accumulated chain score: sqrt(sum s_i^2).
 - A chain ID is assigned to each token.
 
 Input and output are flat (B, N, 9) ChirpTokens.  Window structure is
@@ -77,7 +77,7 @@ def _build_dag(tokens: torch.Tensor, groups: list[torch.Tensor],
     """
     W = len(groups)
 
-    snr = tokens[:, 0]
+    score = tokens[:, 0]
     f_start = tokens[:, 3]
     f_end = tokens[:, 4]
     A_start = tokens[:, 5]
@@ -90,11 +90,11 @@ def _build_dag(tokens: torch.Tensor, groups: list[torch.Tensor],
         window_edges = []
         for ip in groups[w]:
             ip = ip.item()
-            if snr[ip] <= 0:
+            if score[ip] <= 0:
                 continue
             for in_ in groups[w + 1]:
                 in_ = in_.item()
-                if snr[in_] <= 0:
+                if score[in_] <= 0:
                     continue
                 fe = f_end[ip]
                 fs = f_start[in_]
@@ -112,40 +112,40 @@ def _build_dag(tokens: torch.Tensor, groups: list[torch.Tensor],
                 window_edges.append((ip, in_))
         edges.append(window_edges)
 
-    # DP: best chain ending at each flat index, accumulating SNR².
-    # Using SNR² so greedy selection maximizes sqrt(Σ s_i²),
+    # DP: best chain ending at each flat index, accumulating score².
+    # Using score² so greedy selection maximizes sqrt(Σ s_i²),
     # consistent with the enrichment step.
     chains: dict[int, tuple[float, list[int]]] = {}
 
     for idx in groups[0]:
         idx = idx.item()
-        if snr[idx] > 0:
-            s = snr[idx].item()
+        if score[idx] > 0:
+            s = score[idx].item()
             chains[idx] = (s * s, [idx])
 
     for w in range(W - 1):
         for ip, in_ in edges[w]:
             if ip not in chains:
                 continue
-            prev_snr_sq, prev_path = chains[ip]
-            s = snr[in_].item()
-            new_snr_sq = prev_snr_sq + s * s
-            if in_ not in chains or chains[in_][0] < new_snr_sq:
-                chains[in_] = (new_snr_sq, prev_path + [in_])
+            prev_score_sq, prev_path = chains[ip]
+            s = score[in_].item()
+            new_score_sq = prev_score_sq + s * s
+            if in_ not in chains or chains[in_][0] < new_score_sq:
+                chains[in_] = (new_score_sq, prev_path + [in_])
 
     # Seed unreached tokens.
     for w in range(1, W):
         for idx in groups[w]:
             idx = idx.item()
-            if snr[idx] > 0 and idx not in chains:
-                s = snr[idx].item()
+            if score[idx] > 0 and idx not in chains:
+                s = score[idx].item()
                 chains[idx] = (s * s, [idx])
 
     return edges, chains
 
 
 def _greedy_assign(chains: dict) -> list[list[int]]:
-    """Greedily assign non-overlapping chains by total SNR².
+    """Greedily assign non-overlapping chains by total score².
 
     Returns list of paths (each path is a list of flat token indices).
     """
@@ -196,7 +196,7 @@ class ChirpLinker(nn.Module):
         Returns
         -------
         linked : LinkedChirpTokens
-            Same 9-field data (with updated SNR/boundaries) plus
+            Same 9-field data (with updated score/boundaries) plus
             a separate chain_id LongTensor (B, N).
         """
         B, N, C = tokens.shape
@@ -240,14 +240,14 @@ class ChirpLinker(nn.Module):
                 chain_id[idx] = chain_counter
             chain_counter += 1
 
-            # Accumulated SNR: sqrt(sum s_i^2).
-            snr_sq_sum = 0.0
+            # Accumulated score: sqrt(sum s_i^2).
+            score_sq_sum = 0.0
             for idx in path:
-                snr_sq_sum += tokens[idx, 0].item() ** 2
-            snr_combined = snr_sq_sum ** 0.5
+                score_sq_sum += tokens[idx, 0].item() ** 2
+            score_combined = score_sq_sum ** 0.5
 
             for idx in path:
-                tokens[idx, 0] = snr_combined
+                tokens[idx, 0] = score_combined
 
             # Smooth boundaries between consecutive tokens in the chain.
             for i in range(V - 1):

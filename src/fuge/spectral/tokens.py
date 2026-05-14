@@ -9,7 +9,7 @@ import torch
 
 
 # Field indices for the 9-field token format.
-SNR = 0
+SCORE = 0
 T_START = 1
 T_END = 2
 F_START = 3
@@ -26,7 +26,8 @@ class ChirpTokens:
     """Structured wrapper around chirp token tensor.
 
     Fields (per token):
-        0: snr          — peak amplitude (or accumulated SNR after linking)
+        0: score        — amplitude / noise_std (SNR) when noise is calibrated,
+                          raw amplitude otherwise; replaced by chain score after linking
         1: t_start      — sample index at token start (t = -1/2)
         2: t_end        — sample index at token end (t = +1/2)
         3: f_start      — frequency at start (cycles/sample)
@@ -66,8 +67,8 @@ class ChirpTokens:
         return type(self)(self.data.to(*args, **kwargs))
 
     @property
-    def snr(self) -> torch.Tensor:
-        return self.data[..., SNR]
+    def score(self) -> torch.Tensor:
+        return self.data[..., SCORE]
 
     @property
     def t_start(self) -> torch.Tensor:
@@ -116,7 +117,7 @@ class LinkedChirpTokens(ChirpTokens):
     Parameters
     ----------
     data : Tensor, shape (B, N, 9)
-        Token data (same 9 fields, with updated SNR/boundaries after linking).
+        Token data (same 9 fields, with updated score/boundaries after linking).
     chain_id : LongTensor, shape (B, N)
         Chain assignment per token. -1 = unlinked.
     """
