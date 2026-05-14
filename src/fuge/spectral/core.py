@@ -573,7 +573,7 @@ class NoiseModel(nn.Module):
         x : Tensor, shape (B, N)
         """
         X = self._stft(x, dlnf=0., start=self.start)[:, :, 0, :]  # (B, W, Fk)
-        std_new = X.abs().std(dim=0)                                 # (W, Fk)
+        std_new = X.abs().mean(dim=0)                                # (W, Fk) mean amplitude
         if self.noise_std is None:
             self.noise_std = std_new
         else:
