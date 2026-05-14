@@ -775,12 +775,17 @@ class DyadicChirpTokenizer(nn.Module):
     n_tokens : int or None
         If set, forward() truncates or zero-pads output to this many tokens
         (fixed shape, suitable for batched ML).  If None, return all tokens.
+    f_min, f_max : float or None
+        Frequency band in cycles/sample (0–0.5).  Tokens whose centre
+        frequency falls outside [f_min, f_max] have their score zeroed and
+        sink to the bottom of the sorted output.  None means no limit.
     """
 
     def __init__(self, k_min: int = 256, k_max: int = 1024,
                  n_peaks: int = 3, n_dlnf: int = 11,
                  dlnf_max: float = 0.3, momentum: float = 0.99,
-                 n_tokens: int | None = None):
+                 n_tokens: int | None = None,
+                 f_min: float | None = None, f_max: float | None = None):
         super().__init__()
         assert k_min % 4 == 0, f"k_min must be divisible by 4, got {k_min}"
         assert k_max >= k_min, f"k_max must be >= k_min"
@@ -803,6 +808,8 @@ class DyadicChirpTokenizer(nn.Module):
         self.k_max = k_max
         self.k_values = k_values
         self.n_tokens = n_tokens
+        self.f_min = f_min
+        self.f_max = f_max
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor,
@@ -824,6 +831,15 @@ class DyadicChirpTokenizer(nn.Module):
         """
         parts = [tok(x, noise=noise).data for tok in self.tokenizers]
         combined = torch.cat(parts, dim=1)  # (B, N_total, 9)
+
+        if self.f_min is not None or self.f_max is not None:
+            f_centre = (combined[..., 3] + combined[..., 4]) / 2  # (B, N_total)
+            mask = torch.ones_like(f_centre, dtype=torch.bool)
+            if self.f_min is not None:
+                mask &= f_centre >= self.f_min
+            if self.f_max is not None:
+                mask &= f_centre <= self.f_max
+            combined[..., 0] = combined[..., 0] * mask  # zero score of out-of-band tokens
 
         order = combined[..., 0].argsort(dim=1, descending=True)
         combined = combined.gather(1, order.unsqueeze(-1).expand_as(combined))
