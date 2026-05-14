@@ -772,11 +772,15 @@ class DyadicChirpTokenizer(nn.Module):
         clamped at 0.5.  Default 0.3.
     momentum : float
         EMA momentum for each scale's noise model (default 0.99).
+    n_tokens : int or None
+        If set, forward() truncates or zero-pads output to this many tokens
+        (fixed shape, suitable for batched ML).  If None, return all tokens.
     """
 
     def __init__(self, k_min: int = 256, k_max: int = 1024,
                  n_peaks: int = 3, n_dlnf: int = 11,
-                 dlnf_max: float = 0.3, momentum: float = 0.99):
+                 dlnf_max: float = 0.3, momentum: float = 0.99,
+                 n_tokens: int | None = None):
         super().__init__()
         assert k_min % 4 == 0, f"k_min must be divisible by 4, got {k_min}"
         assert k_max >= k_min, f"k_max must be >= k_min"
@@ -798,11 +802,11 @@ class DyadicChirpTokenizer(nn.Module):
         self.k_min = k_min
         self.k_max = k_max
         self.k_values = k_values
+        self.n_tokens = n_tokens
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor,
-                noise: torch.Tensor | None = None,
-                n_tokens: int | None = None) -> ChirpTokens:
+                noise: torch.Tensor | None = None) -> ChirpTokens:
         """Tokenize at all scales and return tokens sorted by score descending.
 
         Parameters
@@ -810,17 +814,13 @@ class DyadicChirpTokenizer(nn.Module):
         x : Tensor, shape (B, N)
         noise : Tensor, shape (B, N) or None
             Pure-noise time series; updates the noise model at every scale.
-        n_tokens : int or None
-            If set, truncate or pad the output to exactly this many tokens
-            per batch element (fixed output shape, suitable for batched ML).
-            Tokens beyond the top n_tokens are zero-padded (score=0).
-            If None, return all tokens from all scales.
 
         Returns
         -------
         tokens : ChirpTokens, shape (B, n_tokens, 9) or (B, N_total, 9)
             All tokens from all scales, score-sorted (descending).
-            N_total = Σ_k  W_k · n_peaks  (deterministic for fixed-length x).
+            If n_tokens was set at construction, output is truncated or
+            zero-padded to that length.  Otherwise N_total = Σ_k W_k·n_peaks.
         """
         parts = [tok(x, noise=noise).data for tok in self.tokenizers]
         combined = torch.cat(parts, dim=1)  # (B, N_total, 9)
@@ -828,12 +828,12 @@ class DyadicChirpTokenizer(nn.Module):
         order = combined[..., 0].argsort(dim=1, descending=True)
         combined = combined.gather(1, order.unsqueeze(-1).expand_as(combined))
 
-        if n_tokens is not None:
+        if self.n_tokens is not None:
             N_total = combined.shape[1]
-            if n_tokens <= N_total:
-                combined = combined[:, :n_tokens]
+            if self.n_tokens <= N_total:
+                combined = combined[:, :self.n_tokens]
             else:
-                pad = combined.new_zeros(combined.shape[0], n_tokens - N_total, 9)
+                pad = combined.new_zeros(combined.shape[0], self.n_tokens - N_total, 9)
                 combined = torch.cat([combined, pad], dim=1)
 
         return ChirpTokens(combined)
